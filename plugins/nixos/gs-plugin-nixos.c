@@ -646,19 +646,12 @@ gs_plugin_nixos_setup_finish (GsPlugin *plugin, GAsyncResult *result, GError **e
 }
 
 static gchar *
-guess_nix_package_name (GsApp *app)
+guess_nix_package_name_from_id (const gchar *app_id)
 {
-	GPtrArray *sources = gs_app_get_sources (app);
-	const gchar *app_id;
 	g_autofree gchar *id_without_ext = NULL;
 	const gchar *last_dot;
 	gchar *name = NULL;
 
-	if (sources != NULL && sources->len > 0) {
-		return g_strdup (g_ptr_array_index (sources, 0));
-	}
-
-	app_id = gs_app_get_id (app);
 	if (app_id == NULL)
 		return NULL;
 
@@ -676,6 +669,20 @@ guess_nix_package_name (GsApp *app)
 	}
 
 	return name;
+}
+
+static gchar *
+guess_nix_package_name (GsApp *app)
+{
+	GPtrArray *sources = gs_app_get_sources (app);
+	const gchar *app_id;
+
+	if (sources != NULL && sources->len > 0) {
+		return g_strdup (g_ptr_array_index (sources, 0));
+	}
+
+	app_id = gs_app_get_id (app);
+	return guess_nix_package_name_from_id (app_id);
 }
 
 static gboolean
@@ -894,6 +901,8 @@ is_desktop_app_installed (const gchar *app_id)
 	g_autoptr(GPtrArray) dirs = NULL;
 	const gchar * const *data_dirs = NULL;
 	g_autofree gchar *desktop_name = NULL;
+	g_autofree gchar *guessed_pkg = NULL;
+	g_autofree gchar *guessed_desktop = NULL;
 	guint i;
 
 	if (app_id == NULL)
@@ -912,16 +921,28 @@ is_desktop_app_installed (const gchar *app_id)
 		desktop_name = g_strdup_printf ("%s.desktop", app_id);
 	}
 
+	guessed_pkg = guess_nix_package_name_from_id (app_id);
+	if (guessed_pkg != NULL) {
+		guessed_desktop = g_strdup_printf ("%s.desktop", guessed_pkg);
+	}
+
 	for (i = 0; i < dirs->len; i++) {
 		const gchar *apps_dir = g_ptr_array_index (dirs, i);
-		g_autofree gchar *file_path = NULL;
+		g_autofree gchar *file_path1 = NULL;
+		g_autofree gchar *file_path2 = NULL;
 
 		if (g_strstr_len (apps_dir, -1, "/flatpak/") != NULL)
 			continue;
 
-		file_path = g_build_filename (apps_dir, desktop_name, NULL);
-		if (g_file_test (file_path, G_FILE_TEST_EXISTS))
+		file_path1 = g_build_filename (apps_dir, desktop_name, NULL);
+		if (g_file_test (file_path1, G_FILE_TEST_EXISTS))
 			return TRUE;
+
+		if (guessed_desktop != NULL) {
+			file_path2 = g_build_filename (apps_dir, guessed_desktop, NULL);
+			if (g_file_test (file_path2, G_FILE_TEST_EXISTS))
+				return TRUE;
+		}
 	}
 
 	return FALSE;
@@ -959,6 +980,12 @@ list_installed_desktop_apps (GsPlugin *plugin, GsAppList *merged)
 			g_autofree gchar *pkg_name = NULL;
 			const gchar *last_dot = NULL;
 			g_autoptr(GsApp) app = NULL;
+			g_autofree gchar *file_path = NULL;
+			g_autoptr(GKeyFile) key_file = NULL;
+			g_autofree gchar *desktop_name = NULL;
+			g_autofree gchar *desktop_comment = NULL;
+			g_autofree gchar *desktop_icon = NULL;
+			g_autofree gchar *nodisplay_str = NULL;
 
 			if (!g_str_has_suffix (filename, ".desktop"))
 				continue;
@@ -968,6 +995,18 @@ list_installed_desktop_apps (GsPlugin *plugin, GsAppList *merged)
 
 			g_hash_table_add (seen_ids, g_strdup (filename));
 
+			file_path = g_build_filename (apps_dir, filename, NULL);
+			key_file = g_key_file_new ();
+			if (g_key_file_load_from_file (key_file, file_path, G_KEY_FILE_NONE, NULL)) {
+				nodisplay_str = g_key_file_get_string (key_file, "Desktop Entry", "NoDisplay", NULL);
+				if (nodisplay_str != NULL && g_ascii_strcasecmp (nodisplay_str, "true") == 0) {
+					continue;
+				}
+				desktop_name = g_key_file_get_locale_string (key_file, "Desktop Entry", "Name", NULL, NULL);
+				desktop_comment = g_key_file_get_locale_string (key_file, "Desktop Entry", "Comment", NULL, NULL);
+				desktop_icon = g_key_file_get_locale_string (key_file, "Desktop Entry", "Icon", NULL, NULL);
+			}
+
 			pkg_name = g_strndup (filename, strlen (filename) - 8);
 
 			app = gs_app_new (filename);
@@ -976,6 +1015,21 @@ list_installed_desktop_apps (GsPlugin *plugin, GsAppList *merged)
 			gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
 			gs_app_set_management_plugin (app, plugin);
 			gs_app_add_source (app, pkg_name);
+
+			if (desktop_name != NULL) {
+				gs_app_set_name (app, GS_APP_QUALITY_NORMAL, desktop_name);
+			} else {
+				gs_app_set_name (app, GS_APP_QUALITY_NORMAL, pkg_name);
+			}
+
+			if (desktop_comment != NULL) {
+				gs_app_set_summary (app, GS_APP_QUALITY_NORMAL, desktop_comment);
+			}
+
+			if (desktop_icon != NULL) {
+				g_autoptr(GIcon) gicon = g_themed_icon_new (desktop_icon);
+				gs_app_add_icon (app, gicon);
+			}
 
 			last_dot = g_strrstr (pkg_name, ".");
 			if (last_dot != NULL) {
@@ -1186,6 +1240,11 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 			gchar *pkg_name = guess_nix_package_name (alternate_of);
 			if (pkg_name != NULL) {
 				g_autoptr(GsApp) app = gs_app_new (app_id);
+				const gchar *name = gs_app_get_name (alternate_of);
+				const gchar *summary = gs_app_get_summary (alternate_of);
+				g_autoptr(GPtrArray) icons = gs_app_dup_icons (alternate_of);
+				gboolean installed;
+
 				gs_app_set_management_plugin (app, plugin);
 				gs_app_set_kind (app, gs_app_get_kind (alternate_of));
 				gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
@@ -1195,7 +1254,20 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 				gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "Nix");
 				gs_app_set_metadata (app, "GnomeSoftware::PackagingBaseCssColor", "accent_color");
 
-				gboolean installed = is_package_installed (self, pkg_name);
+				if (name != NULL)
+					gs_app_set_name (app, GS_APP_QUALITY_NORMAL, name);
+				if (summary != NULL)
+					gs_app_set_summary (app, GS_APP_QUALITY_NORMAL, summary);
+
+				if (icons != NULL) {
+					guint j;
+					for (j = 0; j < icons->len; j++) {
+						GIcon *icon = g_ptr_array_index (icons, j);
+						gs_app_add_icon (app, icon);
+					}
+				}
+
+				installed = is_package_installed (self, pkg_name);
 				if (installed) {
 					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
 				} else {
