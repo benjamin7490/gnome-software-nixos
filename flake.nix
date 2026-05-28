@@ -21,18 +21,42 @@
             version = "51.alpha-nixos";
             src = self;
 
-            # Add glib-testing to buildInputs as required by 51.alpha
             buildInputs = (oldAttrs.buildInputs or []) ++ [
               pkgs.glib-testing
             ];
 
-            # Ensure the NixOS plugin is enabled in meson
             mesonFlags = (oldAttrs.mesonFlags or []) ++ [
               "-Dnixos=true"
             ];
           });
           default = self.packages.${system}.gnome-software;
         });
+
+      # NixOS module — remplace gnome-software par la version NixOS
+      nixosModules.default = { pkgs, lib, config, ... }: {
+        options.programs.gnome-software-nixos.enable =
+          lib.mkEnableOption "GNOME Software avec support NixOS natif";
+
+        config = lib.mkIf config.programs.gnome-software-nixos.enable {
+          nixpkgs.overlays = [
+            (final: prev: {
+              gnome-software = self.packages.${prev.stdenv.hostPlatform.system}.gnome-software;
+            })
+          ];
+
+          environment.systemPackages = [ pkgs.gnome-software ];
+
+          # Autorise pkexec nixos-rebuild via polkit pour les utilisateurs wheel
+          security.polkit.extraConfig = ''
+            polkit.addRule(function(action, subject) {
+              if (action.id == "org.freedesktop.systemd1.manage-units" &&
+                  subject.isInGroup("wheel")) {
+                return polkit.Result.YES;
+              }
+            });
+          '';
+        };
+      };
 
       devShells = forAllSystems (system:
         let
