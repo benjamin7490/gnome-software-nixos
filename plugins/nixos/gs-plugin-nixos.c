@@ -932,6 +932,92 @@ merge_declarative_and_system_packages (GsPlugin *plugin, GsAppList *merged)
 	}
 }
 
+static void
+list_nix_channels (GsPlugin *plugin, GsAppList *merged)
+{
+	g_autoptr(GError) local_error = NULL;
+	const gchar *system_channels_dir = "/nix/var/nix/profiles/per-user/root/channels";
+	g_autofree gchar *user_channels_file = NULL;
+
+	/* 1. List System Channels */
+	if (g_file_test (system_channels_dir, G_FILE_TEST_IS_DIR)) {
+		g_autoptr(GDir) dir = g_dir_open (system_channels_dir, 0, &local_error);
+		if (dir != NULL) {
+			const gchar *name;
+			while ((name = g_dir_read_name (dir)) != NULL) {
+				g_autofree gchar *app_id = NULL;
+				g_autoptr(GsApp) app = NULL;
+				if (g_strcmp0 (name, ".") == 0 ||
+				    g_strcmp0 (name, "..") == 0 ||
+				    g_strcmp0 (name, "manifest.nix") == 0) {
+					continue;
+				}
+
+				app_id = g_strdup_printf ("nix-channel-system-%s", name);
+				app = gs_app_new (app_id);
+				gs_app_set_kind (app, AS_COMPONENT_KIND_REPOSITORY);
+				gs_app_set_management_plugin (app, plugin);
+				gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				gs_app_set_name (app, GS_APP_QUALITY_NORMAL, name);
+				gs_app_set_summary (app, GS_APP_QUALITY_NORMAL, "System-wide channel (Read-only)");
+				gs_app_set_metadata (app, "NixOS::channel-scope", "system");
+				gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "Nix");
+				gs_app_set_metadata (app, "GnomeSoftware::PackagingBaseCssColor", "accent_color");
+				gs_app_add_quirk (app, GS_APP_QUIRK_NOT_LAUNCHABLE);
+
+				gs_app_list_add (merged, app);
+			}
+		}
+	}
+
+	/* 2. List User Channels */
+	user_channels_file = g_build_filename (g_get_home_dir (), ".nix-channels", NULL);
+	if (g_file_test (user_channels_file, G_FILE_TEST_EXISTS)) {
+		g_autofree gchar *content = NULL;
+		gsize length = 0;
+		if (g_file_get_contents (user_channels_file, &content, &length, NULL)) {
+			g_auto(GStrv) lines = g_strsplit (content, "\n", -1);
+			guint i;
+			for (i = 0; lines[i] != NULL; i++) {
+				gchar *line = lines[i];
+				gboolean is_disabled = FALSE;
+				g_auto(GStrv) tokens = NULL;
+
+				g_strstrip (line);
+				if (line[0] == '\0')
+					continue;
+
+				if (line[0] == '#') {
+					is_disabled = TRUE;
+					line++;
+					g_strstrip (line);
+				}
+
+				/* Split URL and NAME */
+				tokens = g_strsplit_set (line, " \t", -1);
+				if (tokens[0] != NULL && tokens[1] != NULL) {
+					const gchar *url = tokens[0];
+					const gchar *name = tokens[1];
+					g_autofree gchar *app_id = g_strdup_printf ("nix-channel-user-%s", name);
+					g_autoptr(GsApp) app = gs_app_new (app_id);
+					gs_app_set_kind (app, AS_COMPONENT_KIND_REPOSITORY);
+					gs_app_set_management_plugin (app, plugin);
+					gs_app_set_state (app, is_disabled ? GS_APP_STATE_AVAILABLE : GS_APP_STATE_INSTALLED);
+					gs_app_set_name (app, GS_APP_QUALITY_NORMAL, name);
+					gs_app_set_summary (app, GS_APP_QUALITY_NORMAL, url);
+					gs_app_set_metadata (app, "NixOS::channel-scope", "user");
+					gs_app_set_metadata (app, "NixOS::channel-url", url);
+					gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "Nix");
+					gs_app_set_metadata (app, "GnomeSoftware::PackagingBaseCssColor", "accent_color");
+					gs_app_add_quirk (app, GS_APP_QUIRK_NOT_LAUNCHABLE);
+
+					gs_app_list_add (merged, app);
+				}
+			}
+		}
+	}
+}
+
 static void list_apps_communicate_cb (GObject *source_object, GAsyncResult *result, gpointer user_data);
 
 static void
@@ -952,11 +1038,25 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 	g_autoptr(GError) local_error = NULL;
 	ListAppsData *data = NULL;
 	g_autoptr(GsAppList) merged = NULL;
+	const AsComponentKind *component_kinds = NULL;
+	gboolean queries_repos = FALSE;
 
 	g_task_set_source_tag (task, gs_plugin_nixos_list_apps_async);
 
 	if (query == NULL) {
 		g_task_return_pointer (task, gs_app_list_new (), g_object_unref);
+		return;
+	}
+
+	component_kinds = gs_app_query_get_component_kinds (query);
+	if (component_kinds != NULL && gs_component_kind_array_contains (component_kinds, AS_COMPONENT_KIND_REPOSITORY)) {
+		queries_repos = TRUE;
+	}
+
+	if (queries_repos) {
+		g_autoptr(GsAppList) repo_list = gs_app_list_new ();
+		list_nix_channels (plugin, repo_list);
+		g_task_return_pointer (task, g_steal_pointer (&repo_list), g_object_unref);
 		return;
 	}
 
@@ -2123,6 +2223,383 @@ gs_plugin_nixos_refine_finish (GsPlugin      *plugin,
 	return g_task_propagate_boolean (G_TASK (result), error);
 }
 
+static gboolean
+set_user_channel_enabled (const gchar *name, gboolean enabled, GError **error)
+{
+	g_autofree gchar *user_channels_file = g_build_filename (g_get_home_dir (), ".nix-channels", NULL);
+	g_autofree gchar *content = NULL;
+	gsize length = 0;
+	g_auto(GStrv) lines = NULL;
+	GString *new_content = NULL;
+	gboolean found = FALSE;
+	guint i;
+	gboolean res;
+
+	if (!g_file_test (user_channels_file, G_FILE_TEST_EXISTS)) {
+		g_set_error_literal (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED, "No user channels file found");
+		return FALSE;
+	}
+
+	if (!g_file_get_contents (user_channels_file, &content, &length, error)) {
+		return FALSE;
+	}
+
+	lines = g_strsplit (content, "\n", -1);
+	new_content = g_string_new ("");
+
+	for (i = 0; lines[i] != NULL; i++) {
+		gchar *line = lines[i];
+		gchar *trimmed = g_strdup (line);
+		gboolean is_disabled = FALSE;
+		gchar *p = NULL;
+		g_auto(GStrv) tokens = NULL;
+
+		g_strstrip (trimmed);
+
+		if (trimmed[0] == '\0') {
+			g_string_append_printf (new_content, "%s\n", line);
+			g_free (trimmed);
+			continue;
+		}
+
+		is_disabled = (trimmed[0] == '#');
+		p = is_disabled ? trimmed + 1 : trimmed;
+		g_strstrip (p);
+
+		tokens = g_strsplit_set (p, " \t", -1);
+		if (tokens[0] != NULL && tokens[1] != NULL) {
+			const gchar *cname = tokens[1];
+			if (g_strcmp0 (cname, name) == 0) {
+				found = TRUE;
+				if (enabled) {
+					/* Enable: write without # */
+					g_string_append_printf (new_content, "%s %s\n", tokens[0], tokens[1]);
+				} else {
+					/* Disable: write with # */
+					g_string_append_printf (new_content, "# %s %s\n", tokens[0], tokens[1]);
+				}
+			} else {
+				g_string_append_printf (new_content, "%s\n", line);
+			}
+		} else {
+			g_string_append_printf (new_content, "%s\n", line);
+		}
+		g_free (trimmed);
+	}
+
+	if (!found) {
+		g_string_free (new_content, TRUE);
+		g_set_error (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED, "Channel %s not found", name);
+		return FALSE;
+	}
+
+	res = g_file_set_contents (user_channels_file, new_content->str, new_content->len, error);
+	g_string_free (new_content, TRUE);
+	return res;
+}
+
+static gboolean
+add_user_channel (const gchar *name, const gchar *url, GError **error)
+{
+	g_autofree gchar *user_channels_file = g_build_filename (g_get_home_dir (), ".nix-channels", NULL);
+	GString *new_content = g_string_new ("");
+	gboolean res;
+
+	if (g_file_test (user_channels_file, G_FILE_TEST_EXISTS)) {
+		g_autofree gchar *content = NULL;
+		gsize length = 0;
+		if (!g_file_get_contents (user_channels_file, &content, &length, error)) {
+			g_string_free (new_content, TRUE);
+			return FALSE;
+		}
+		g_string_append (new_content, content);
+		if (new_content->len > 0 && new_content->str[new_content->len - 1] != '\n') {
+			g_string_append_c (new_content, '\n');
+		}
+	}
+
+	g_string_append_printf (new_content, "%s %s\n", url, name);
+
+	res = g_file_set_contents (user_channels_file, new_content->str, new_content->len, error);
+	g_string_free (new_content, TRUE);
+	return res;
+}
+
+static gboolean
+remove_user_channel (const gchar *name, GError **error)
+{
+	g_autofree gchar *user_channels_file = g_build_filename (g_get_home_dir (), ".nix-channels", NULL);
+	g_autofree gchar *content = NULL;
+	gsize length = 0;
+	g_auto(GStrv) lines = NULL;
+	GString *new_content = NULL;
+	gboolean found = FALSE;
+	guint i;
+	gboolean res;
+
+	if (!g_file_test (user_channels_file, G_FILE_TEST_EXISTS)) {
+		g_set_error_literal (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED, "No user channels file found");
+		return FALSE;
+	}
+
+	if (!g_file_get_contents (user_channels_file, &content, &length, error)) {
+		return FALSE;
+	}
+
+	lines = g_strsplit (content, "\n", -1);
+	new_content = g_string_new ("");
+
+	for (i = 0; lines[i] != NULL; i++) {
+		gchar *line = lines[i];
+		gchar *trimmed = g_strdup (line);
+		gboolean is_disabled = FALSE;
+		gchar *p = NULL;
+		g_auto(GStrv) tokens = NULL;
+
+		g_strstrip (trimmed);
+
+		if (trimmed[0] == '\0') {
+			g_string_append_printf (new_content, "%s\n", line);
+			g_free (trimmed);
+			continue;
+		}
+
+		is_disabled = (trimmed[0] == '#');
+		p = is_disabled ? trimmed + 1 : trimmed;
+		g_strstrip (p);
+
+		tokens = g_strsplit_set (p, " \t", -1);
+		if (tokens[0] != NULL && tokens[1] != NULL) {
+			const gchar *cname = tokens[1];
+			if (g_strcmp0 (cname, name) == 0) {
+				found = TRUE;
+				/* Skip this line to remove it */
+			} else {
+				g_string_append_printf (new_content, "%s\n", line);
+			}
+		} else {
+			g_string_append_printf (new_content, "%s\n", line);
+		}
+		g_free (trimmed);
+	}
+
+	if (!found) {
+		g_string_free (new_content, TRUE);
+		g_set_error (error, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED, "Channel %s not found", name);
+		return FALSE;
+	}
+
+	res = g_file_set_contents (user_channels_file, new_content->str, new_content->len, error);
+	g_string_free (new_content, TRUE);
+	return res;
+}
+
+static void
+gs_plugin_nixos_enable_repository_async (GsPlugin                      *plugin,
+                                         GsApp                         *repository,
+                                         GsPluginManageRepositoryFlags  flags,
+                                         GsPluginEventCallback          event_callback,
+                                         void                          *event_user_data,
+                                         GCancellable                  *cancellable,
+                                         GAsyncReadyCallback            callback,
+                                         gpointer                       user_data)
+{
+	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	const gchar *name = gs_app_get_name (repository);
+	const gchar *scope = gs_app_get_metadata_item (repository, "NixOS::channel-scope");
+	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *cmd = NULL;
+	g_autoptr(GSubprocess) subprocess = NULL;
+
+	g_task_set_source_tag (task, gs_plugin_nixos_enable_repository_async);
+
+	if (g_strcmp0 (scope, "system") == 0) {
+		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "Cannot modify system-wide channel %s (Read-only)", name);
+		return;
+	}
+
+	if (!set_user_channel_enabled (name, TRUE, &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	cmd = g_strdup_printf ("nix-channel --update %s", name);
+	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+	                               &local_error,
+	                               "sh", "-c", cmd, NULL);
+	if (subprocess == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	gs_app_set_state (repository, GS_APP_STATE_INSTALLED);
+	g_task_set_task_data (task, g_object_ref (subprocess), g_object_unref);
+	g_subprocess_communicate_async (subprocess, NULL, cancellable, command_communicate_cb, g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_nixos_enable_repository_finish (GsPlugin      *plugin,
+                                          GAsyncResult  *result,
+                                          GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_nixos_disable_repository_async (GsPlugin                      *plugin,
+                                          GsApp                         *repository,
+                                          GsPluginManageRepositoryFlags  flags,
+                                          GsPluginEventCallback          event_callback,
+                                          void                          *event_user_data,
+                                          GCancellable                  *cancellable,
+                                          GAsyncReadyCallback            callback,
+                                          gpointer                       user_data)
+{
+	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	const gchar *name = gs_app_get_name (repository);
+	const gchar *scope = gs_app_get_metadata_item (repository, "NixOS::channel-scope");
+	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *cmd = NULL;
+	g_autoptr(GSubprocess) subprocess = NULL;
+
+	g_task_set_source_tag (task, gs_plugin_nixos_disable_repository_async);
+
+	if (g_strcmp0 (scope, "system") == 0) {
+		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "Cannot modify system-wide channel %s (Read-only)", name);
+		return;
+	}
+
+	if (!set_user_channel_enabled (name, FALSE, &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	cmd = g_strdup_printf ("nix-channel --update %s", name);
+	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+	                               &local_error,
+	                               "sh", "-c", cmd, NULL);
+	if (subprocess == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	gs_app_set_state (repository, GS_APP_STATE_AVAILABLE);
+	g_task_set_task_data (task, g_object_ref (subprocess), g_object_unref);
+	g_subprocess_communicate_async (subprocess, NULL, cancellable, command_communicate_cb, g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_nixos_disable_repository_finish (GsPlugin      *plugin,
+                                           GAsyncResult  *result,
+                                           GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_nixos_install_repository_async (GsPlugin                      *plugin,
+                                          GsApp                         *repository,
+                                          GsPluginManageRepositoryFlags  flags,
+                                          GsPluginEventCallback          event_callback,
+                                          void                          *event_user_data,
+                                          GCancellable                  *cancellable,
+                                          GAsyncReadyCallback            callback,
+                                          gpointer                       user_data)
+{
+	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	const gchar *name = gs_app_get_name (repository);
+	const gchar *url = gs_app_get_metadata_item (repository, "NixOS::channel-url");
+	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *cmd = NULL;
+	g_autoptr(GSubprocess) subprocess = NULL;
+
+	g_task_set_source_tag (task, gs_plugin_nixos_install_repository_async);
+
+	if (url == NULL) {
+		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "No URL provided for channel %s", name);
+		return;
+	}
+
+	if (!add_user_channel (name, url, &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	cmd = g_strdup_printf ("nix-channel --add %s %s && nix-channel --update %s", url, name, name);
+	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+	                               &local_error,
+	                               "sh", "-c", cmd, NULL);
+	if (subprocess == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	gs_app_set_state (repository, GS_APP_STATE_INSTALLED);
+	g_task_set_task_data (task, g_object_ref (subprocess), g_object_unref);
+	g_subprocess_communicate_async (subprocess, NULL, cancellable, command_communicate_cb, g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_nixos_install_repository_finish (GsPlugin      *plugin,
+                                           GAsyncResult  *result,
+                                           GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+static void
+gs_plugin_nixos_remove_repository_async (GsPlugin                      *plugin,
+                                         GsApp                         *repository,
+                                         GsPluginManageRepositoryFlags  flags,
+                                         GsPluginEventCallback          event_callback,
+                                         void                          *event_user_data,
+                                         GCancellable                  *cancellable,
+                                         GAsyncReadyCallback            callback,
+                                         gpointer                       user_data)
+{
+	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	const gchar *name = gs_app_get_name (repository);
+	const gchar *scope = gs_app_get_metadata_item (repository, "NixOS::channel-scope");
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GSubprocess) subprocess = NULL;
+
+	g_task_set_source_tag (task, gs_plugin_nixos_remove_repository_async);
+
+	if (g_strcmp0 (scope, "system") == 0) {
+		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "Cannot remove system-wide channel %s (Read-only)", name);
+		return;
+	}
+
+	if (!remove_user_channel (name, &local_error)) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+	                               &local_error,
+	                               "nix-channel", "--remove", name, NULL);
+	if (subprocess == NULL) {
+		g_task_return_error (task, g_steal_pointer (&local_error));
+		return;
+	}
+
+	gs_app_set_state (repository, GS_APP_STATE_UNAVAILABLE);
+	g_task_set_task_data (task, g_object_ref (subprocess), g_object_unref);
+	g_subprocess_communicate_async (subprocess, NULL, cancellable, command_communicate_cb, g_steal_pointer (&task));
+}
+
+static gboolean
+gs_plugin_nixos_remove_repository_finish (GsPlugin      *plugin,
+                                          GAsyncResult  *result,
+                                          GError       **error)
+{
+	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
 static void
 gs_plugin_nixos_class_init (GsPluginNixosClass *klass)
 {
@@ -2144,6 +2621,15 @@ gs_plugin_nixos_class_init (GsPluginNixosClass *klass)
 	plugin_class->update_apps_finish = gs_plugin_nixos_update_apps_finish;
 	plugin_class->refine_async = gs_plugin_nixos_refine_async;
 	plugin_class->refine_finish = gs_plugin_nixos_refine_finish;
+
+	plugin_class->install_repository_async = gs_plugin_nixos_install_repository_async;
+	plugin_class->install_repository_finish = gs_plugin_nixos_install_repository_finish;
+	plugin_class->remove_repository_async = gs_plugin_nixos_remove_repository_async;
+	plugin_class->remove_repository_finish = gs_plugin_nixos_remove_repository_finish;
+	plugin_class->enable_repository_async = gs_plugin_nixos_enable_repository_async;
+	plugin_class->enable_repository_finish = gs_plugin_nixos_enable_repository_finish;
+	plugin_class->disable_repository_async = gs_plugin_nixos_disable_repository_async;
+	plugin_class->disable_repository_finish = gs_plugin_nixos_disable_repository_finish;
 }
 
 GType
