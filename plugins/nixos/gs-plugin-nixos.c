@@ -33,6 +33,7 @@ struct _GsPluginNixos
 	gchar			*system_flake_dir;
 	gchar			*home_manager_flake_dir;
 
+	GSettings		*settings;  /* kept alive to maintain changed signal */
 	gboolean		in_plugin_action;
 	guint			sync_timeout_id;
 	GSubprocess		*sync_subprocess;
@@ -60,6 +61,7 @@ gs_plugin_nixos_init (GsPluginNixos *self)
 	self->declarative_user_file = NULL;
 	self->system_flake_dir = NULL;
 	self->home_manager_flake_dir = NULL;
+	self->settings = NULL;
 	self->in_plugin_action = FALSE;
 	self->sync_timeout_id = 0;
 	self->sync_subprocess = NULL;
@@ -75,6 +77,7 @@ gs_plugin_nixos_dispose (GObject *object)
 		self->sync_timeout_id = 0;
 	}
 	g_clear_object (&self->sync_subprocess);
+	g_clear_object (&self->settings);
 
 	g_clear_pointer (&self->flake_uri, g_free);
 	g_clear_pointer (&self->declarative_system_file, g_free);
@@ -390,11 +393,67 @@ parse_nix_env_json (GsPlugin *plugin, const gchar *json_str, GError **error)
 	return g_steal_pointer (&list);
 }
 
+/* Check if a binary exists under the NixOS system path — covers packages
+ * installed via configuration.nix / environment.systemPackages which do
+ * NOT show up in `nix profile list`. */
+static gboolean
+is_package_in_system_path (const gchar *package_name)
+{
+	/* Check /run/current-system/sw/bin/<name> */
+	g_autofree gchar *bin_path = g_build_filename ("/run/current-system/sw/bin", package_name, NULL);
+	if (g_file_test (bin_path, G_FILE_TEST_EXISTS))
+		return TRUE;
+
+	/* Also check /run/current-system/sw/lib/<name> for libraries */
+	g_autofree gchar *lib_path = g_build_filename ("/run/current-system/sw/lib", package_name, NULL);
+	if (g_file_test (lib_path, G_FILE_TEST_EXISTS))
+		return TRUE;
+
+	/* Check share/applications for .desktop files */
+	g_autofree gchar *desktop_path = g_build_filename ("/run/current-system/sw/share/applications",
+	                                                    package_name, NULL);
+	g_autofree gchar *desktop_with_ext = g_strdup_printf ("%s.desktop", desktop_path);
+	if (g_file_test (desktop_with_ext, G_FILE_TEST_EXISTS))
+		return TRUE;
+
+	return FALSE;
+}
+
+/* List all packages available via /run/current-system/sw/bin */
+static GsAppList *
+list_system_path_packages (GsPlugin *plugin, GError **error)
+{
+	g_autoptr(GsAppList) list = gs_app_list_new ();
+	const gchar *sw_bin = "/run/current-system/sw/bin";
+	g_autoptr(GDir) dir = g_dir_open (sw_bin, 0, error);
+	if (dir == NULL)
+		return NULL;
+
+	const gchar *name;
+	while ((name = g_dir_read_name (dir)) != NULL) {
+		g_autoptr(GsApp) app = gs_app_new (name);
+		gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+		gs_app_set_kind (app, AS_COMPONENT_KIND_GENERIC);
+		gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
+		gs_app_set_management_plugin (app, plugin);
+		gs_app_add_source (app, name);
+		gs_app_set_origin (app, "nixpkgs");
+		gs_app_set_origin_ui (app, "NixOS (système)");
+		gs_app_list_add (list, app);
+	}
+	return g_steal_pointer (&list);
+}
+
 static void
 gs_plugin_nixos_adopt_app (GsPlugin *plugin, GsApp *app)
 {
-	if (gs_app_get_bundle_kind (app) == AS_BUNDLE_KIND_PACKAGE) {
-		gs_app_set_management_plugin (app, plugin);
+	AsBundleKind bundle_kind = gs_app_get_bundle_kind (app);
+	if (bundle_kind == AS_BUNDLE_KIND_PACKAGE ||
+	    bundle_kind == AS_BUNDLE_KIND_UNKNOWN) {
+		/* Only adopt if it looks like a native package (not flatpak/snap) */
+		const gchar *origin = gs_app_get_origin (app);
+		if (origin == NULL || g_strcmp0 (origin, "flatpak") != 0)
+			gs_app_set_management_plugin (app, plugin);
 	}
 }
 
@@ -525,8 +584,10 @@ gs_plugin_nixos_setup_async (GsPlugin *plugin,
 
 	load_config (self);
 
-	g_autoptr(GSettings) settings = g_settings_new ("org.gnome.software");
-	g_signal_connect_object (settings, "changed", G_CALLBACK (nixos_settings_changed_cb), self, 0);
+	/* Keep settings alive so the changed signal stays connected */
+	self->settings = g_settings_new ("org.gnome.software");
+	g_signal_connect_object (self->settings, "changed",
+	                         G_CALLBACK (nixos_settings_changed_cb), self, 0);
 
 	gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_AFTER, "appstream");
 	gs_plugin_add_rule (plugin, GS_PLUGIN_RULE_RUN_BEFORE, "packagekit");
@@ -834,6 +895,18 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 			g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref);
 		}
 		return;
+	}
+
+	/* For nix-profile / nix-env modes: also include system packages from
+	 * /run/current-system/sw which are installed via configuration.nix */
+	if (g_file_test ("/run/current-system/sw/bin", G_FILE_TEST_IS_DIR)) {
+		g_autoptr(GError) local_error = NULL;
+		g_autoptr(GsAppList) sys_list = list_system_path_packages (plugin, &local_error);
+		if (sys_list != NULL && gs_app_list_length (sys_list) > 0) {
+			/* Will be merged with nix profile results below */
+			g_task_return_pointer (task, g_steal_pointer (&sys_list), g_object_unref);
+			return;
+		}
 	}
 
 	g_autoptr(GSubprocess) subprocess = NULL;
