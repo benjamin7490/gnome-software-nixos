@@ -2414,17 +2414,15 @@ gs_plugin_nixos_enable_repository_async (GsPlugin                      *plugin,
 	g_task_set_source_tag (task, gs_plugin_nixos_enable_repository_async);
 
 	if (g_strcmp0 (scope, "system") == 0) {
-		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
-		                         "Cannot modify system-wide channel %s (Read-only)", name);
-		return;
+		cmd = g_strdup_printf ("pkexec sh -c \"sed -i -E 's/^#[[:space:]]*([^[:space:]]+[[:space:]]+%s)$/\\\\1/' /root/.nix-channels && nix-channel --update %s\"", name, name);
+	} else {
+		if (!set_user_channel_enabled (name, TRUE, &local_error)) {
+			g_task_return_error (task, g_steal_pointer (&local_error));
+			return;
+		}
+		cmd = g_strdup_printf ("nix-channel --update %s", name);
 	}
 
-	if (!set_user_channel_enabled (name, TRUE, &local_error)) {
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
-	}
-
-	cmd = g_strdup_printf ("nix-channel --update %s", name);
 	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
 	                               &local_error,
 	                               "sh", "-c", cmd, NULL);
@@ -2440,8 +2438,8 @@ gs_plugin_nixos_enable_repository_async (GsPlugin                      *plugin,
 
 static gboolean
 gs_plugin_nixos_enable_repository_finish (GsPlugin      *plugin,
-                                          GAsyncResult  *result,
-                                          GError       **error)
+                                           GAsyncResult  *result,
+                                           GError       **error)
 {
 	return g_task_propagate_boolean (G_TASK (result), error);
 }
@@ -2466,17 +2464,15 @@ gs_plugin_nixos_disable_repository_async (GsPlugin                      *plugin,
 	g_task_set_source_tag (task, gs_plugin_nixos_disable_repository_async);
 
 	if (g_strcmp0 (scope, "system") == 0) {
-		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
-		                         "Cannot modify system-wide channel %s (Read-only)", name);
-		return;
+		cmd = g_strdup_printf ("pkexec sh -c \"sed -i -E 's/^([^#[:space:]]+[[:space:]]+%s)$/# \\\\1/' /root/.nix-channels && nix-channel --update %s\"", name, name);
+	} else {
+		if (!set_user_channel_enabled (name, FALSE, &local_error)) {
+			g_task_return_error (task, g_steal_pointer (&local_error));
+			return;
+		}
+		cmd = g_strdup_printf ("nix-channel --update %s", name);
 	}
 
-	if (!set_user_channel_enabled (name, FALSE, &local_error)) {
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
-	}
-
-	cmd = g_strdup_printf ("nix-channel --update %s", name);
 	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
 	                               &local_error,
 	                               "sh", "-c", cmd, NULL);
@@ -2514,6 +2510,8 @@ gs_plugin_nixos_install_repository_async (GsPlugin                      *plugin,
 	g_autoptr(GError) local_error = NULL;
 	g_autofree gchar *cmd = NULL;
 	g_autoptr(GSubprocess) subprocess = NULL;
+	AsComponentScope app_scope = gs_app_get_scope (repository);
+	gboolean is_system = (app_scope == AS_COMPONENT_SCOPE_SYSTEM);
 
 	g_task_set_source_tag (task, gs_plugin_nixos_install_repository_async);
 
@@ -2523,12 +2521,16 @@ gs_plugin_nixos_install_repository_async (GsPlugin                      *plugin,
 		return;
 	}
 
-	if (!add_user_channel (name, url, &local_error)) {
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
+	if (is_system) {
+		cmd = g_strdup_printf ("pkexec nix-channel --add %s %s && pkexec nix-channel --update %s", url, name, name);
+	} else {
+		if (!add_user_channel (name, url, &local_error)) {
+			g_task_return_error (task, g_steal_pointer (&local_error));
+			return;
+		}
+		cmd = g_strdup_printf ("nix-channel --add %s %s && nix-channel --update %s", url, name, name);
 	}
 
-	cmd = g_strdup_printf ("nix-channel --add %s %s && nix-channel --update %s", url, name, name);
 	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
 	                               &local_error,
 	                               "sh", "-c", cmd, NULL);
@@ -2564,24 +2566,24 @@ gs_plugin_nixos_remove_repository_async (GsPlugin                      *plugin,
 	const gchar *name = gs_app_get_name (repository);
 	const gchar *scope = gs_app_get_metadata_item (repository, "NixOS::channel-scope");
 	g_autoptr(GError) local_error = NULL;
+	g_autofree gchar *cmd = NULL;
 	g_autoptr(GSubprocess) subprocess = NULL;
 
 	g_task_set_source_tag (task, gs_plugin_nixos_remove_repository_async);
 
 	if (g_strcmp0 (scope, "system") == 0) {
-		g_task_return_new_error (task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
-		                         "Cannot remove system-wide channel %s (Read-only)", name);
-		return;
-	}
-
-	if (!remove_user_channel (name, &local_error)) {
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
+		cmd = g_strdup_printf ("pkexec nix-channel --remove %s", name);
+	} else {
+		if (!remove_user_channel (name, &local_error)) {
+			g_task_return_error (task, g_steal_pointer (&local_error));
+			return;
+		}
+		cmd = g_strdup_printf ("nix-channel --remove %s", name);
 	}
 
 	subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
 	                               &local_error,
-	                               "nix-channel", "--remove", name, NULL);
+	                               "sh", "-c", cmd, NULL);
 	if (subprocess == NULL) {
 		g_task_return_error (task, g_steal_pointer (&local_error));
 		return;
