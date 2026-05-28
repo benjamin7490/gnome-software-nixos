@@ -104,5 +104,103 @@
         </child>
       </object>
     </child>
+    <child>
+      <object class="AdwPreferencesPage" id="nixos_page">
+        <property name="title" translatable="yes">NixOS</property>
+        <property name="icon-name">system-run-symbolic</property>
+        <child>
+          <object class="AdwPreferencesGroup">
+            <property name="title" translatable="yes">NixOS Integration Mode</property>
+            <child>
+              <object class="AdwComboRow" id="nixos_mode_row">
+                <property name="title" translatable="yes">Installation Mode</property>
+                <property name="subtitle" translatable="yes">Choose how GNOME Software manages Nix packages</property>
+                <property name="model">
+                  <object class="GtkStringList">
+                    <items>
+                      <item translatable="yes">Nix Profile (Flakes)</item>
+                      <item translatable="yes">Nix Env (Legacy)</item>
+                      <item translatable="yes">Declarative System (/etc/nixos)</item>
+                      <item translatable="yes">Declarative User (Home Manager)</item>
+                    </items>
+                  </object>
+                </property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwEntryRow" id="nixos_flake_uri_row">
+                <property name="title" translatable="yes">Flake URI</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="AdwPreferencesGroup" id="nixos_declarative_group">
+            <property name="title" translatable="yes">Declarative File Paths</property>
+            <child>
+              <object class="AdwEntryRow" id="nixos_declarative_system_file_row">
+                <property name="title" translatable="yes">System Nix File</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwEntryRow" id="nixos_declarative_user_file_row">
+                <property name="title" translatable="yes">User Nix File</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwEntryRow" id="nixos_system_flake_dir_row">
+                <property name="title" translatable="yes">System Flake Directory</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwEntryRow" id="nixos_home_manager_flake_dir_row">
+                <property name="title" translatable="yes">Home Manager Flake Directory</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <child>
+          <object class="AdwPreferencesGroup" id="nixos_options_group">
+            <property name="title" translatable="yes">NixOS System Features (Declarative Only)</property>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_option_steam_row">
+                <property name="title" translatable="yes">Steam integration</property>
+                <property name="subtitle" translatable="yes">Enable programs.steam.enable</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_option_docker_row">
+                <property name="title" translatable="yes">Docker virtualization</property>
+                <property name="subtitle" translatable="yes">Enable virtualisation.docker.enable</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_option_virtualbox_row">
+                <property name="title" translatable="yes">VirtualBox hypervisor</property>
+                <property name="subtitle" translatable="yes">Enable virtualisation.virtualbox.host.enable</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_option_wireshark_row">
+                <property name="title" translatable="yes">Wireshark packet capture</property>
+                <property name="subtitle" translatable="yes">Enable programs.wireshark.enable</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_option_gparted_row">
+                <property name="title" translatable="yes">GParted partition manager</property>
+                <property name="subtitle" translatable="yes">Enable programs.gparted.enable</property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_option_flatpak_row">
+                <property name="title" translatable="yes">Flatpak support</property>
+                <property name="subtitle" translatable="yes">Enable services.flatpak.enable</property>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </child>
   </template>
 </interface>

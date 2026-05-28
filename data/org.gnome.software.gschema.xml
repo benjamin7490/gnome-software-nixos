@@ -150,6 +150,55 @@
       <default>0</default>
       <summary>The timestamp of the last received historical updates.</summary>
     </key>
+    <key name="nixos-mode" type="s">
+      <default>'nix-profile'</default>
+      <summary>The installation mode for NixOS plugin</summary>
+      <description>Supported values: nix-profile, nix-env, declarative-system, declarative-user</description>
+    </key>
+    <key name="nixos-flake-uri" type="s">
+      <default>'nixpkgs'</default>
+      <summary>The Flake URI to use when installing packages</summary>
+    </key>
+    <key name="nixos-declarative-system-file" type="s">
+      <default>'/etc/nixos/gnome-software-packages.nix'</default>
+      <summary>Nix file where system-wide declarative packages are written</summary>
+    </key>
+    <key name="nixos-declarative-user-file" type="s">
+      <default>'~/.config/home-manager/gnome-software-packages.nix'</default>
+      <summary>Nix file where user declarative packages are written</summary>
+    </key>
+    <key name="nixos-system-flake-dir" type="s">
+      <default>'/etc/nixos'</default>
+      <summary>Directory containing the system flake.nix</summary>
+    </key>
+    <key name="nixos-home-manager-flake-dir" type="s">
+      <default>'~/.config/home-manager'</default>
+      <summary>Directory containing the Home Manager flake.nix</summary>
+    </key>
+    <key name="nixos-option-steam" type="b">
+      <default>false</default>
+      <summary>Enable Steam NixOS option</summary>
+    </key>
+    <key name="nixos-option-docker" type="b">
+      <default>false</default>
+      <summary>Enable Docker NixOS option</summary>
+    </key>
+    <key name="nixos-option-virtualbox" type="b">
+      <default>false</default>
+      <summary>Enable VirtualBox NixOS option</summary>
+    </key>
+    <key name="nixos-option-wireshark" type="b">
+      <default>false</default>
+      <summary>Enable Wireshark NixOS option</summary>
+    </key>
+    <key name="nixos-option-gparted" type="b">
+      <default>false</default>
+      <summary>Enable GParted NixOS option</summary>
+    </key>
+    <key name="nixos-option-flatpak" type="b">
+      <default>false</default>
+      <summary>Enable Flatpak NixOS option</summary>
+    </key>
     <child name="auth" schema="org.gnome.software.auth"/>
   </schema>
   <schema id="org.gnome.software.auth" gettext-domain="gnome-software">

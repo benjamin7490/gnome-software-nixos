@@ -19,3 +19,9 @@ subprojects/sassc/
 subprojects/sysprof/
 subprojects/wayland-protocols.wrap
 subprojects/wayland-protocols/
+
+# Nix build output
+result
+install/
+subprojects/.wraplock
+_build/
