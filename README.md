@@ -1,20 +1,19 @@
-[![Build Status](https://gitlab.gnome.org/GNOME/gnome-software/badges/main/pipeline.svg)](https://gitlab.gnome.org/GNOME/gnome-software/pipelines)
-
-# Software
+# GNOME Software (NixOS Edition)
 
 [Software](https://apps.gnome.org/Software) allows users to easily find,
-discover and install apps. It also keeps their OS, apps and devices up to date
-without them having to think about it, and gives them confidence that their
-system is up to date. It supports popular distributions, subject to those
-distributions maintaining their own distro-specific integration code.
+discover and install apps. This fork is customized for **NixOS** to support native package management (via Nix profiles, nix-env, configuration.nix, or Home Manager) while retaining robust out-of-the-box Flatpak support.
 
 The specific use cases that Software covers are [documented in more detail](./doc/use-cases.md).
 
-# Features
+# Features & NixOS Support
 
 A plugin system is used to access software from different sources.
 Plugins are provided for:
- - Traditional package installation via PackageKit (e.g. Debian package, RPM).
+ - **NixOS package management** (`gs-plugin-nixos`) supporting:
+   - Flakes-based user profiles (`nix profile`) or legacy user profiles (`nix-env`).
+   - Declarative system packages (`/etc/nixos/gnome-software-packages.nix` in `configuration.nix`) or Home Manager user packages.
+   - Intelligent detection of system configurations and automatic fallback.
+   - Declarative mappings for system options (Steam, Docker, VirtualBox, etc.).
  - Next generation packages: [Flatpak](https://flatpak.org/) and [Snap](https://snapcraft.io/).
  - Firmware updates.
  - Ratings and reviews using [ODRS](https://odrs.gnome.org/).
@@ -79,24 +78,63 @@ $ flatpak install --bundle ./gnome-software-dev.flatpak
 $ flatpak run org.gnome.SoftwareDevel
 ```
 
-# Building locally
+# Nix Flake & NixOS Usage
 
-Software uses a number of plugins and depending on your operating system you
-may want to disable or enable certain ones. For example on Fedora Silverblue
-you'd want to disable the packagekit plugin as it wouldn't work. See the list
-in `meson_options.txt` and use e.g. `-Dpackagekit=false` in the `meson` command
-below.
+This fork is packaged as a Nix Flake, making it very easy to build, run, and install.
 
-Build locally with:
+## Building and Running locally with Nix
+
+```bash
+# Build the flake package (produces ./result)
+nix build .#gnome-software
+
+# Run the compiled application directly
+nix run .#gnome-software -- --verbose
 ```
-$ meson --prefix $PWD/install build/
-$ ninja -C build/ all install
-$ killall gnome-software
-# On Fedora, RHEL, etc:
-$ XDG_DATA_DIRS=install/share:$XDG_DATA_DIRS LD_LIBRARY_PATH=install/lib64/:$LD_LIBRARY_PATH ./install/bin/gnome-software
-# On Debian, Ubuntu, etc:
-$ XDG_DATA_DIRS=install/share:$XDG_DATA_DIRS LD_LIBRARY_PATH=install/lib/x86_64-linux-gnu/:$LD_LIBRARY_PATH ./install/bin/gnome-software
+
+To run manually with local debugging:
+```bash
+# Quit running system instance
+gnome-software --quit
+
+# Enter development shell and run with local installation paths
+nix-shell -A gnome-software '<nixpkgs>' --run "XDG_DATA_DIRS=\$PWD/install/share:\$XDG_DATA_DIRS LD_LIBRARY_PATH=\$PWD/install/lib64:\$PWD/install/lib64/gnome-software:\$LD_LIBRARY_PATH ./install/bin/gnome-software --verbose"
 ```
+
+## Adding to NixOS System Configuration
+
+You can consume this fork by adding it as an input to your system `flake.nix` and overriding the package:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    gnome-software-nixos.url = "github:benjamin7490/gnome-software-nixos";
+  };
+
+  outputs = { self, nixpkgs, gnome-software-nixos, ... }@inputs: {
+    nixosConfigurations.my-system = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        ({ pkgs, ... }: {
+          environment.systemPackages = [
+            gnome-software-nixos.packages.${pkgs.system}.default
+          ];
+        })
+      ];
+    };
+  };
+}
+```
+
+## Configuration
+
+On first run, the plugin creates a configuration file at `~/.config/gnome-software/nixos.json`. You can modify the `"mode"` key to choose your preferred NixOS backend:
+- `"nix-profile"` (Default if Flakes are enabled)
+- `"nix-env"` (Default if Flakes are disabled)
+- `"declarative-system"` (Manages `/etc/nixos/gnome-software-packages.nix` with root elevation)
+- `"declarative-user"` (Manages `~/.config/home-manager/gnome-software-packages.nix`)
 
 # Debugging
 
