@@ -27,3 +27,5 @@ option('dkms', type : 'boolean', value : false, description : 'enable DKMS plugi
 # FIXME Switch the systemd-sysupdate option to true by default once
 # systemd-sysupdate and Software's matching plugin are deemed mature enough.
 option('systemd-sysupdate', type : 'boolean', value : false, description : 'enable systemd-sysupdate support')
+option('nixos', type : 'boolean', value : true, description : 'enable NixOS support')
+

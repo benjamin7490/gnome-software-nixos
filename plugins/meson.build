@@ -50,3 +50,8 @@ endif
 if get_option('systemd-sysupdate')
   subdir('systemd-sysupdate')
 endif
+
+if get_option('nixos')
+  subdir('nixos')
+endif
+
