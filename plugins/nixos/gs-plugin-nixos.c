@@ -649,20 +649,30 @@ static gchar *
 guess_nix_package_name (GsApp *app)
 {
 	GPtrArray *sources = gs_app_get_sources (app);
+	const gchar *app_id;
+	g_autofree gchar *id_without_ext = NULL;
+	const gchar *last_dot;
+	gchar *name = NULL;
+
 	if (sources != NULL && sources->len > 0) {
 		return g_strdup (g_ptr_array_index (sources, 0));
 	}
 
-	const gchar *app_id = gs_app_get_id (app);
+	app_id = gs_app_get_id (app);
 	if (app_id == NULL)
 		return NULL;
 
-	const gchar *last_dot = g_strrstr (app_id, ".");
-	gchar *name = NULL;
+	if (g_str_has_suffix (app_id, ".desktop")) {
+		id_without_ext = g_strndup (app_id, strlen (app_id) - 8);
+	} else {
+		id_without_ext = g_strdup (app_id);
+	}
+
+	last_dot = g_strrstr (id_without_ext, ".");
 	if (last_dot != NULL) {
 		name = g_ascii_strdown (last_dot + 1, -1);
 	} else {
-		name = g_ascii_strdown (app_id, -1);
+		name = g_ascii_strdown (id_without_ext, -1);
 	}
 
 	return name;
@@ -878,6 +888,111 @@ get_nix_profile_index_by_package_name (GsPluginNixos *self, const gchar *package
 	return index_str;
 }
 
+static gboolean
+is_desktop_app_installed (const gchar *app_id)
+{
+	g_autoptr(GPtrArray) dirs = NULL;
+	const gchar * const *data_dirs = NULL;
+	g_autofree gchar *desktop_name = NULL;
+	guint i;
+
+	if (app_id == NULL)
+		return FALSE;
+
+	dirs = g_ptr_array_new_with_free_func (g_free);
+	data_dirs = g_get_system_data_dirs ();
+	for (i = 0; data_dirs[i] != NULL; i++) {
+		g_ptr_array_add (dirs, g_build_filename (data_dirs[i], "applications", NULL));
+	}
+	g_ptr_array_add (dirs, g_build_filename (g_get_user_data_dir (), "applications", NULL));
+
+	if (g_str_has_suffix (app_id, ".desktop")) {
+		desktop_name = g_strdup (app_id);
+	} else {
+		desktop_name = g_strdup_printf ("%s.desktop", app_id);
+	}
+
+	for (i = 0; i < dirs->len; i++) {
+		const gchar *apps_dir = g_ptr_array_index (dirs, i);
+		g_autofree gchar *file_path = NULL;
+
+		if (g_strstr_len (apps_dir, -1, "/flatpak/") != NULL)
+			continue;
+
+		file_path = g_build_filename (apps_dir, desktop_name, NULL);
+		if (g_file_test (file_path, G_FILE_TEST_EXISTS))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+static void
+list_installed_desktop_apps (GsPlugin *plugin, GsAppList *merged)
+{
+	g_autoptr(GHashTable) seen_ids = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+	g_autoptr(GPtrArray) dirs = g_ptr_array_new_with_free_func (g_free);
+	const gchar * const *data_dirs = g_get_system_data_dirs ();
+	guint i;
+
+	for (i = 0; data_dirs[i] != NULL; i++) {
+		g_ptr_array_add (dirs, g_build_filename (data_dirs[i], "applications", NULL));
+	}
+	g_ptr_array_add (dirs, g_build_filename (g_get_user_data_dir (), "applications", NULL));
+
+	for (i = 0; i < dirs->len; i++) {
+		const gchar *apps_dir = g_ptr_array_index (dirs, i);
+		g_autoptr(GDir) dir = NULL;
+		const gchar *filename = NULL;
+
+		if (g_strstr_len (apps_dir, -1, "/flatpak/") != NULL)
+			continue;
+
+		if (!g_file_test (apps_dir, G_FILE_TEST_IS_DIR))
+			continue;
+
+		dir = g_dir_open (apps_dir, 0, NULL);
+		if (dir == NULL)
+			continue;
+
+		while ((filename = g_dir_read_name (dir)) != NULL) {
+			g_autofree gchar *pkg_name = NULL;
+			const gchar *last_dot = NULL;
+			g_autoptr(GsApp) app = NULL;
+
+			if (!g_str_has_suffix (filename, ".desktop"))
+				continue;
+
+			if (g_hash_table_contains (seen_ids, filename))
+				continue;
+
+			g_hash_table_add (seen_ids, g_strdup (filename));
+
+			pkg_name = g_strndup (filename, strlen (filename) - 8);
+
+			app = gs_app_new (filename);
+			gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+			gs_app_set_kind (app, AS_COMPONENT_KIND_DESKTOP_APP);
+			gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
+			gs_app_set_management_plugin (app, plugin);
+			gs_app_add_source (app, pkg_name);
+
+			last_dot = g_strrstr (pkg_name, ".");
+			if (last_dot != NULL) {
+				g_autofree gchar *attr_name = g_ascii_strdown (last_dot + 1, -1);
+				gs_app_add_source (app, attr_name);
+			}
+
+			gs_app_set_origin (app, "nixpkgs");
+			gs_app_set_origin_ui (app, "NixOS");
+			gs_app_set_metadata (app, "GnomeSoftware::PackagingFormat", "Nix");
+			gs_app_set_metadata (app, "GnomeSoftware::PackagingBaseCssColor", "accent_color");
+
+			gs_app_list_add (merged, app);
+		}
+	}
+}
+
 static void
 merge_declarative_and_system_packages (GsPlugin *plugin, GsAppList *merged)
 {
@@ -890,7 +1005,10 @@ merge_declarative_and_system_packages (GsPlugin *plugin, GsAppList *merged)
 	g_autoptr(GsAppList) sys_path_list = NULL;
 	guint i;
 
-	/* 1. System declarative (configuration.nix) */
+	/* 1. Add all installed desktop applications from active profiles */
+	list_installed_desktop_apps (plugin, merged);
+
+	/* 2. System declarative (configuration.nix) */
 	if (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE &&
 	    self->declarative_system_file != NULL) {
 		sys_list = list_declarative_packages (plugin, self->declarative_system_file, &sys_error);
@@ -904,7 +1022,7 @@ merge_declarative_and_system_packages (GsPlugin *plugin, GsAppList *merged)
 		}
 	}
 
-	/* 2. User declarative (home-manager) */
+	/* 3. User declarative (home-manager) */
 	if (self->user_backend == GS_NIXOS_BACKEND_DECLARATIVE &&
 	    self->declarative_user_file != NULL) {
 		user_list = list_declarative_packages (plugin, self->declarative_user_file, &user_error);
@@ -918,7 +1036,7 @@ merge_declarative_and_system_packages (GsPlugin *plugin, GsAppList *merged)
 		}
 	}
 
-	/* 3. System path fallback — always add packages from /run/current-system/sw */
+	/* 4. System path fallback — always add packages from /run/current-system/sw */
 	if (g_file_test ("/run/current-system/sw/bin", G_FILE_TEST_IS_DIR)) {
 		sys_path_list = list_system_path_packages (plugin, &path_error);
 		if (sys_path_list != NULL) {
@@ -2185,17 +2303,32 @@ gs_plugin_nixos_refine_async (GsPlugin                   *plugin,
 		GsApp *app = gs_app_list_index (list, i);
 		g_autofree gchar *pkg_name = NULL;
 		const gchar *install_src = NULL;
+		const gchar *app_id = NULL;
+		gboolean is_installed = FALSE;
 
 		if (!gs_app_has_management_plugin (app, plugin))
 			continue;
 
-		pkg_name = guess_nix_package_name (app);
-		if (pkg_name == NULL)
-			continue;
+		app_id = gs_app_get_id (app);
+		if (is_desktop_app_installed (app_id)) {
+			is_installed = TRUE;
+			pkg_name = guess_nix_package_name (app);
+			if (pkg_name != NULL) {
+				install_src = detect_package_install_source (self, pkg_name);
+			}
+			if (install_src == NULL) {
+				install_src = "system";
+			}
+		} else {
+			pkg_name = guess_nix_package_name (app);
+			if (pkg_name != NULL) {
+				install_src = detect_package_install_source (self, pkg_name);
+				if (install_src != NULL)
+					is_installed = TRUE;
+			}
+		}
 
-		/* Refine state */
-		install_src = detect_package_install_source (self, pkg_name);
-		if (install_src != NULL) {
+		if (is_installed) {
 			if (gs_app_get_state (app) != GS_APP_STATE_INSTALLED)
 				gs_app_set_state (app, GS_APP_STATE_INSTALLED);
 			gs_app_set_metadata (app, "NixOS::install-source", install_src);
