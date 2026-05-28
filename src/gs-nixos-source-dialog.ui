@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <template class="GsNixosSourceDialog" parent="AdwDialog">
+    <property name="title" translatable="yes">Choisir la méthode d'installation</property>
+    <property name="content-width">420</property>
+    <child>
+      <object class="AdwToolbarView">
+        <child type="top">
+          <object class="AdwHeaderBar"/>
+        </child>
+        <property name="content">
+          <object class="GtkBox">
+            <property name="orientation">vertical</property>
+            <property name="spacing">24</property>
+            <property name="margin-top">24</property>
+            <property name="margin-bottom">24</property>
+            <property name="margin-start">24</property>
+            <property name="margin-end">24</property>
+
+            <!-- App name label -->
+            <child>
+              <object class="GtkLabel" id="app_name_label">
+                <property name="wrap">True</property>
+                <property name="justify">center</property>
+                <property name="halign">center</property>
+                <style>
+                  <class name="title-2"/>
+                </style>
+              </object>
+            </child>
+
+            <child>
+              <object class="GtkLabel">
+                <property name="label" translatable="yes">Choisissez comment installer cette application :</property>
+                <property name="wrap">True</property>
+                <property name="halign">start</property>
+              </object>
+            </child>
+
+            <!-- Source choices list -->
+            <child>
+              <object class="AdwPreferencesGroup" id="sources_group">
+                <!-- Rows added dynamically in C code -->
+              </object>
+            </child>
+
+            <!-- Action buttons -->
+            <child>
+              <object class="GtkBox">
+                <property name="orientation">horizontal</property>
+                <property name="spacing">12</property>
+                <property name="halign">end</property>
+                <child>
+                  <object class="GtkButton" id="cancel_button">
+                    <property name="label" translatable="yes">Annuler</property>
+                    <property name="action-name">window.close</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkButton" id="install_button">
+                    <property name="label" translatable="yes">Installer</property>
+                    <property name="sensitive">False</property>
+                    <style>
+                      <class name="suggested-action"/>
+                    </style>
+                  </object>
+                </child>
+              </object>
+            </child>
+
+          </object>
+        </property>
+      </object>
+    </child>
+  </template>
+</interface>

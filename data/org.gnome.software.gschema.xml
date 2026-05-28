@@ -152,8 +152,23 @@
     </key>
     <key name="nixos-mode" type="s">
       <default>'nix-profile'</default>
-      <summary>The installation mode for NixOS plugin</summary>
-      <description>Supported values: nix-profile, nix-env, declarative-system, declarative-user</description>
+      <summary>DEPRECATED — use nixos-system-backend / nixos-user-backend</summary>
+      <description>Kept for backward compatibility only.</description>
+    </key>
+    <key name="nixos-system-backend" type="s">
+      <default>'none'</default>
+      <summary>Backend système NixOS</summary>
+      <description>Méthode pour les paquets système. Valeurs: 'declarative' (configuration.nix), 'none'.</description>
+    </key>
+    <key name="nixos-user-backend" type="s">
+      <default>'profile'</default>
+      <summary>Backend utilisateur NixOS</summary>
+      <description>Méthode pour les paquets utilisateur. Valeurs: 'declarative' (home-manager), 'profile' (nix profile), 'env' (nix-env), 'none'.</description>
+    </key>
+    <key name="nixos-use-flakes" type="b">
+      <default>false</default>
+      <summary>Utiliser les flakes NixOS</summary>
+      <description>Si activé, utilise --flake lors de nixos-rebuild switch et home-manager switch.</description>
     </key>
     <key name="nixos-flake-uri" type="s">
       <default>'nixpkgs'</default>

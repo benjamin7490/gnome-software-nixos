@@ -130,11 +130,18 @@ You can consume this fork by adding it as an input to your system `flake.nix` an
 
 ## Configuration
 
-On first run, the plugin creates a configuration file at `~/.config/gnome-software/nixos.json`. You can modify the `"mode"` key to choose your preferred NixOS backend:
-- `"nix-profile"` (Default if Flakes are enabled)
-- `"nix-env"` (Default if Flakes are disabled)
-- `"declarative-system"` (Manages `/etc/nixos/gnome-software-packages.nix` with root elevation)
-- `"declarative-user"` (Manages `~/.config/home-manager/gnome-software-packages.nix`)
+The NixOS plugin is configured via GSettings (available in the application Preferences page under **NixOS**). You can enable multiple backends simultaneously to run in hybrid mode:
+- **System Backend (`nixos-system-backend`)**:
+  - `"declarative"`: Manages system packages declaratively in `/etc/nixos/gnome-software-packages.nix` (calls `nixos-rebuild switch` via `pkexec`).
+  - `"none"` (Default): Disables system declarative backend.
+- **User Backend (`nixos-user-backend`)**:
+  - `"declarative"`: Manages user packages declaratively via Home Manager (`~/.config/home-manager/gnome-software-packages.nix` and `home-manager switch`).
+  - `"profile"` (Default): Manages user packages imperatively via `nix profile install`.
+  - `"env"`: Manages user packages imperatively via legacy `nix-env -i`.
+  - `"none"`: Disables user backend.
+- **Use Flakes (`nixos-use-flakes`)**: A boolean key to control whether `--flake` options are passed to rebuilds/switches.
+
+When multiple backends are active, a **source chooser dialog** will automatically appear at install time, allowing you to select your preferred target (System, Home Manager, Nix Profile, or Flatpak if available).
 
 # Debugging
 

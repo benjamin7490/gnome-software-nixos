@@ -112,19 +112,39 @@
           <object class="AdwPreferencesGroup">
             <property name="title" translatable="yes">NixOS Integration Mode</property>
             <child>
-              <object class="AdwComboRow" id="nixos_mode_row">
-                <property name="title" translatable="yes">Installation Mode</property>
-                <property name="subtitle" translatable="yes">Choose how GNOME Software manages Nix packages</property>
+              <object class="AdwComboRow" id="nixos_system_backend_row">
+                <property name="title" translatable="yes">System Backend</property>
+                <property name="subtitle" translatable="yes">Method for system packages (configuration.nix)</property>
                 <property name="model">
                   <object class="GtkStringList">
                     <items>
-                      <item translatable="yes">Nix Profile (Flakes)</item>
-                      <item translatable="yes">Nix Env (Legacy)</item>
-                      <item translatable="yes">Declarative System (/etc/nixos)</item>
-                      <item translatable="yes">Declarative User (Home Manager)</item>
+                      <item translatable="yes">Disabled</item>
+                      <item translatable="yes">Declarative System</item>
                     </items>
                   </object>
                 </property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwComboRow" id="nixos_user_backend_row">
+                <property name="title" translatable="yes">User Backend</property>
+                <property name="subtitle" translatable="yes">Method for user packages (home-manager, profile, env)</property>
+                <property name="model">
+                  <object class="GtkStringList">
+                    <items>
+                      <item translatable="yes">Disabled</item>
+                      <item translatable="yes">Declarative User (Home Manager)</item>
+                      <item translatable="yes">Nix Profile (Flakes)</item>
+                      <item translatable="yes">Nix Env (Legacy)</item>
+                    </items>
+                  </object>
+                </property>
+              </object>
+            </child>
+            <child>
+              <object class="AdwSwitchRow" id="nixos_use_flakes_row">
+                <property name="title" translatable="yes">Use Flakes</property>
+                <property name="subtitle" translatable="yes">Use --flake argument during rebuild / HM switch</property>
               </object>
             </child>
             <child>

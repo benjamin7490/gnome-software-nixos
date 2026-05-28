@@ -33,7 +33,9 @@ struct _GsPrefsDialog
 	AdwActionRow		*show_only_verified_apps_row;
 
 	GtkWidget		*nixos_page;
-	GtkWidget		*nixos_mode_row;
+	GtkWidget		*nixos_system_backend_row;
+	GtkWidget		*nixos_user_backend_row;
+	GtkWidget		*nixos_use_flakes_row;
 	GtkWidget		*nixos_flake_uri_row;
 	GtkWidget		*nixos_declarative_system_file_row;
 	GtkWidget		*nixos_declarative_user_file_row;
@@ -92,58 +94,78 @@ gs_prefs_dialog_dispose (GObject *object)
 }
 
 static gboolean
-nixos_mode_to_selected (GValue *value, GVariant *variant, gpointer user_data)
+nixos_system_backend_to_selected (GValue *value, GVariant *variant, gpointer user_data)
 {
-	const gchar *mode = g_variant_get_string (variant, NULL);
+	const gchar *backend = g_variant_get_string (variant, NULL);
 	guint selected = 0;
-	if (g_strcmp0 (mode, "nix-profile") == 0)
-		selected = 0;
-	else if (g_strcmp0 (mode, "nix-env") == 0)
+	if (g_strcmp0 (backend, "declarative") == 0)
 		selected = 1;
-	else if (g_strcmp0 (mode, "declarative-system") == 0)
+	g_value_set_uint (value, selected);
+	return TRUE;
+}
+
+static GVariant *
+nixos_selected_to_system_backend (const GValue *value, const GVariantType *expected_type, gpointer user_data)
+{
+	guint selected = g_value_get_uint (value);
+	const gchar *backend = "none";
+	if (selected == 1)
+		backend = "declarative";
+	return g_variant_new_string (backend);
+}
+
+static gboolean
+nixos_user_backend_to_selected (GValue *value, GVariant *variant, gpointer user_data)
+{
+	const gchar *backend = g_variant_get_string (variant, NULL);
+	guint selected = 0;
+	if (g_strcmp0 (backend, "declarative") == 0)
+		selected = 1;
+	else if (g_strcmp0 (backend, "profile") == 0)
 		selected = 2;
-	else if (g_strcmp0 (mode, "declarative-user") == 0)
+	else if (g_strcmp0 (backend, "env") == 0)
 		selected = 3;
 	g_value_set_uint (value, selected);
 	return TRUE;
 }
 
 static GVariant *
-nixos_selected_to_mode (const GValue *value, const GVariantType *expected_type, gpointer user_data)
+nixos_selected_to_user_backend (const GValue *value, const GVariantType *expected_type, gpointer user_data)
 {
 	guint selected = g_value_get_uint (value);
-	const gchar *mode = "nix-profile";
-	if (selected == 0)
-		mode = "nix-profile";
-	else if (selected == 1)
-		mode = "nix-env";
+	const gchar *backend = "none";
+	if (selected == 1)
+		backend = "declarative";
 	else if (selected == 2)
-		mode = "declarative-system";
+		backend = "profile";
 	else if (selected == 3)
-		mode = "declarative-user";
-	return g_variant_new_string (mode);
+		backend = "env";
+	return g_variant_new_string (backend);
 }
 
 static void
-nixos_mode_changed_cb (GsPrefsDialog *self)
+nixos_backend_changed_cb (GsPrefsDialog *self)
 {
-	g_autofree gchar *mode = g_settings_get_string (self->settings, "nixos-mode");
-	gboolean is_declarative = (g_strcmp0 (mode, "declarative-system") == 0 || g_strcmp0 (mode, "declarative-user") == 0);
-	gboolean is_system = (g_strcmp0 (mode, "declarative-system") == 0);
-	gboolean is_user = (g_strcmp0 (mode, "declarative-user") == 0);
+	g_autofree gchar *sys_backend = g_settings_get_string (self->settings, "nixos-system-backend");
+	g_autofree gchar *user_backend = g_settings_get_string (self->settings, "nixos-user-backend");
+	gboolean has_system_decl = (g_strcmp0 (sys_backend, "declarative") == 0);
+	gboolean has_user_decl = (g_strcmp0 (user_backend, "declarative") == 0);
+	gboolean is_declarative = (has_system_decl || has_user_decl);
 
 	gtk_widget_set_sensitive (self->nixos_declarative_group, is_declarative);
-	gtk_widget_set_sensitive (self->nixos_options_group, is_declarative);
+	gtk_widget_set_sensitive (self->nixos_options_group, has_system_decl);
 
-	gtk_widget_set_sensitive (self->nixos_declarative_system_file_row, is_system);
-	gtk_widget_set_sensitive (self->nixos_system_flake_dir_row, is_system);
-	gtk_widget_set_sensitive (self->nixos_declarative_user_file_row, is_user);
-	gtk_widget_set_sensitive (self->nixos_home_manager_flake_dir_row, is_user);
+	gtk_widget_set_sensitive (self->nixos_declarative_system_file_row, has_system_decl);
+	gtk_widget_set_sensitive (self->nixos_system_flake_dir_row, has_system_decl);
+	gtk_widget_set_sensitive (self->nixos_declarative_user_file_row, has_user_decl);
+	gtk_widget_set_sensitive (self->nixos_home_manager_flake_dir_row, has_user_decl);
 }
 
 static void
 gs_prefs_dialog_init (GsPrefsDialog *dialog)
 {
+	gboolean on_nixos;
+
 	gtk_widget_init_template (GTK_WIDGET (dialog));
 
 	dialog->cancellable = g_cancellable_new ();
@@ -175,7 +197,7 @@ gs_prefs_dialog_init (GsPrefsDialog *dialog)
 	g_signal_connect_object (dialog->show_only_verified_apps_row, "notify::active",
 				 G_CALLBACK (gs_prefs_dialog_filters_changed_cb), dialog, G_CONNECT_SWAPPED);
 
-	gboolean on_nixos = g_file_test ("/run/current-system", G_FILE_TEST_EXISTS);
+	on_nixos = g_file_test ("/run/current-system", G_FILE_TEST_EXISTS);
 	if (!on_nixos) {
 		g_autofree gchar *os_release_content = NULL;
 		if (g_file_get_contents ("/etc/os-release", &os_release_content, NULL, NULL)) {
@@ -189,13 +211,22 @@ gs_prefs_dialog_init (GsPrefsDialog *dialog)
 
 	if (on_nixos) {
 		g_settings_bind_with_mapping (dialog->settings,
-					      "nixos-mode",
-					      dialog->nixos_mode_row,
+					      "nixos-system-backend",
+					      dialog->nixos_system_backend_row,
 					      "selected",
 					      G_SETTINGS_BIND_DEFAULT,
-					      nixos_mode_to_selected,
-					      nixos_selected_to_mode,
+					      nixos_system_backend_to_selected,
+					      nixos_selected_to_system_backend,
 					      dialog, NULL);
+		g_settings_bind_with_mapping (dialog->settings,
+					      "nixos-user-backend",
+					      dialog->nixos_user_backend_row,
+					      "selected",
+					      G_SETTINGS_BIND_DEFAULT,
+					      nixos_user_backend_to_selected,
+					      nixos_selected_to_user_backend,
+					      dialog, NULL);
+		g_settings_bind (dialog->settings, "nixos-use-flakes", dialog->nixos_use_flakes_row, "active", G_SETTINGS_BIND_DEFAULT);
 		g_settings_bind (dialog->settings, "nixos-flake-uri", dialog->nixos_flake_uri_row, "text", G_SETTINGS_BIND_DEFAULT);
 		g_settings_bind (dialog->settings, "nixos-declarative-system-file", dialog->nixos_declarative_system_file_row, "text", G_SETTINGS_BIND_DEFAULT);
 		g_settings_bind (dialog->settings, "nixos-declarative-user-file", dialog->nixos_declarative_user_file_row, "text", G_SETTINGS_BIND_DEFAULT);
@@ -209,10 +240,14 @@ gs_prefs_dialog_init (GsPrefsDialog *dialog)
 		g_settings_bind (dialog->settings, "nixos-option-flatpak", dialog->nixos_option_flatpak_row, "active", G_SETTINGS_BIND_DEFAULT);
 
 		g_signal_connect_object (dialog->settings,
-					 "changed::nixos-mode",
-					 G_CALLBACK (nixos_mode_changed_cb),
+					 "changed::nixos-system-backend",
+					 G_CALLBACK (nixos_backend_changed_cb),
 					 dialog, G_CONNECT_SWAPPED);
-		nixos_mode_changed_cb (dialog);
+		g_signal_connect_object (dialog->settings,
+					 "changed::nixos-user-backend",
+					 G_CALLBACK (nixos_backend_changed_cb),
+					 dialog, G_CONNECT_SWAPPED);
+		nixos_backend_changed_cb (dialog);
 	}
 }
 
@@ -235,7 +270,9 @@ gs_prefs_dialog_class_init (GsPrefsDialogClass *klass)
 	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, show_only_verified_apps_row);
 
 	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_page);
-	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_mode_row);
+	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_system_backend_row);
+	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_user_backend_row);
+	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_use_flakes_row);
 	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_flake_uri_row);
 	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_declarative_system_file_row);
 	gtk_widget_class_bind_template_child (widget_class, GsPrefsDialog, nixos_declarative_user_file_row);
