@@ -362,6 +362,7 @@ parse_nix_profile_json (GsPlugin *plugin, const gchar *json_str, GError **error)
 		gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
 		gs_app_set_management_plugin (app, plugin);
 		gs_app_add_source (app, key);
+		gs_app_set_metadata (app, "NixOS::install-source", "profile");
 
 		if (json_object_has_member (elem, "storePaths")) {
 			JsonArray *paths = json_object_get_array_member (elem, "storePaths");
@@ -425,6 +426,7 @@ parse_nix_env_json (GsPlugin *plugin, const gchar *json_str, GError **error)
 		gs_app_set_bundle_kind (app, AS_BUNDLE_KIND_PACKAGE);
 		gs_app_set_management_plugin (app, plugin);
 		gs_app_add_source (app, pname);
+		gs_app_set_metadata (app, "NixOS::install-source", "env");
 		if (version != NULL) {
 			gs_app_set_version (app, version);
 		}
@@ -724,40 +726,32 @@ is_package_in_nix_env (JsonObject *root_obj, const gchar *package_name)
 	return found;
 }
 
-static gboolean
-is_package_installed (GsPluginNixos *self, const gchar *package_name)
+static const gchar *
+detect_package_install_source (GsPluginNixos *self, const gchar *package_name)
 {
-	gboolean installed = FALSE;
-	if (self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_SYSTEM ||
-	    self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_USER) {
-		g_autoptr(GSettings) settings = g_settings_new ("org.gnome.software");
-		gboolean is_special = FALSE;
-		for (guint j = 0; j < G_N_ELEMENTS (special_options); j++) {
-			if (g_strcmp0 (package_name, special_options[j].package_name) == 0) {
-				is_special = TRUE;
-				break;
-			}
-		}
-		if (is_special) {
-			g_autofree gchar *option_key = g_strdup_printf ("nixos-option-%s", package_name);
-			return g_settings_get_boolean (settings, option_key);
-		}
-
-		const gchar *filepath = (self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_USER) ?
-		                        self->declarative_user_file : self->declarative_system_file;
-		g_autoptr(GPtrArray) packages = parse_nix_file_packages (filepath);
+	/* Check System Declarative file */
+	if (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE && self->declarative_system_file != NULL) {
+		g_autoptr(GPtrArray) packages = parse_nix_file_packages (self->declarative_system_file);
 		for (guint j = 0; j < packages->len; j++) {
-			if (g_strcmp0 (g_ptr_array_index (packages, j), package_name) == 0) {
-				installed = TRUE;
-				break;
-			}
+			if (g_strcmp0 (g_ptr_array_index (packages, j), package_name) == 0)
+				return "system";
 		}
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_NIX_PROFILE) {
+	}
+
+	/* Check User Declarative file */
+	if (self->user_backend == GS_NIXOS_BACKEND_DECLARATIVE && self->declarative_user_file != NULL) {
+		g_autoptr(GPtrArray) packages = parse_nix_file_packages (self->declarative_user_file);
+		for (guint j = 0; j < packages->len; j++) {
+			if (g_strcmp0 (g_ptr_array_index (packages, j), package_name) == 0)
+				return "user";
+		}
+	}
+
+	/* Check Nix Profile */
+	if (self->user_backend == GS_NIXOS_BACKEND_PROFILE) {
 		g_autoptr(GSubprocess) subprocess = NULL;
 		g_autoptr(GBytes) stdout_buf = NULL;
-		g_autoptr(GError) local_error = NULL;
-		subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
-		                               &local_error,
+		subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL,
 		                               "nix", "profile", "list", "--json", NULL);
 		if (subprocess != NULL && g_subprocess_communicate (subprocess, NULL, NULL, &stdout_buf, NULL, NULL)) {
 			const gchar *output = g_bytes_get_data (stdout_buf, NULL);
@@ -769,18 +763,20 @@ is_package_installed (GsPluginNixos *self, const gchar *package_name)
 						JsonObject *root_obj = json_node_get_object (root);
 						if (json_object_has_member (root_obj, "elements")) {
 							JsonObject *elements = json_object_get_object_member (root_obj, "elements");
-							installed = is_package_in_nix_profile (elements, package_name);
+							if (is_package_in_nix_profile (elements, package_name))
+								return "profile";
 						}
 					}
 				}
 			}
 		}
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_NIX_ENV) {
+	}
+
+	/* Check Nix Env */
+	if (self->user_backend == GS_NIXOS_BACKEND_ENV) {
 		g_autoptr(GSubprocess) subprocess = NULL;
 		g_autoptr(GBytes) stdout_buf = NULL;
-		g_autoptr(GError) local_error = NULL;
-		subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
-		                               &local_error,
+		subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE, NULL,
 		                               "nix-env", "-q", "--json", NULL);
 		if (subprocess != NULL && g_subprocess_communicate (subprocess, NULL, NULL, &stdout_buf, NULL, NULL)) {
 			const gchar *output = g_bytes_get_data (stdout_buf, NULL);
@@ -790,13 +786,38 @@ is_package_installed (GsPluginNixos *self, const gchar *package_name)
 					JsonNode *root = json_parser_get_root (parser);
 					if (JSON_NODE_HOLDS_OBJECT (root)) {
 						JsonObject *root_obj = json_node_get_object (root);
-						installed = is_package_in_nix_env (root_obj, package_name);
+						if (is_package_in_nix_env (root_obj, package_name))
+							return "env";
 					}
 				}
 			}
 		}
 	}
-	return installed;
+
+	/* Special options fallback check */
+	if (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE) {
+		g_autoptr(GSettings) settings = g_settings_new ("org.gnome.software");
+		for (guint j = 0; j < G_N_ELEMENTS (special_options); j++) {
+			if (g_strcmp0 (package_name, special_options[j].package_name) == 0) {
+				g_autofree gchar *option_key = g_strdup_printf ("nixos-option-%s", package_name);
+				if (g_settings_get_boolean (settings, option_key))
+					return "system";
+			}
+		}
+	}
+
+	/* Fallback check on system path if it's there */
+	if (is_package_in_system_path (package_name)) {
+		return "system";
+	}
+
+	return NULL;
+}
+
+static gboolean
+is_package_installed (GsPluginNixos *self, const gchar *package_name)
+{
+	return detect_package_install_source (self, package_name) != NULL;
 }
 
 static gchar *
@@ -857,6 +878,60 @@ get_nix_profile_index_by_package_name (GsPluginNixos *self, const gchar *package
 	return index_str;
 }
 
+static void
+merge_declarative_and_system_packages (GsPlugin *plugin, GsAppList *merged)
+{
+	GsPluginNixos *self = GS_PLUGIN_NIXOS (plugin);
+	g_autoptr(GError) sys_error = NULL;
+	g_autoptr(GsAppList) sys_list = NULL;
+	g_autoptr(GError) user_error = NULL;
+	g_autoptr(GsAppList) user_list = NULL;
+	g_autoptr(GError) path_error = NULL;
+	g_autoptr(GsAppList) sys_path_list = NULL;
+	guint i;
+
+	/* 1. System declarative (configuration.nix) */
+	if (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE &&
+	    self->declarative_system_file != NULL) {
+		sys_list = list_declarative_packages (plugin, self->declarative_system_file, &sys_error);
+		if (sys_list != NULL) {
+			for (i = 0; i < gs_app_list_length (sys_list); i++) {
+				GsApp *a = gs_app_list_index (sys_list, i);
+				gs_app_set_metadata (a, "NixOS::install-source", "system");
+				if (gs_app_list_lookup (merged, gs_app_get_unique_id (a)) == NULL)
+					gs_app_list_add (merged, a);
+			}
+		}
+	}
+
+	/* 2. User declarative (home-manager) */
+	if (self->user_backend == GS_NIXOS_BACKEND_DECLARATIVE &&
+	    self->declarative_user_file != NULL) {
+		user_list = list_declarative_packages (plugin, self->declarative_user_file, &user_error);
+		if (user_list != NULL) {
+			for (i = 0; i < gs_app_list_length (user_list); i++) {
+				GsApp *a = gs_app_list_index (user_list, i);
+				gs_app_set_metadata (a, "NixOS::install-source", "user");
+				if (gs_app_list_lookup (merged, gs_app_get_unique_id (a)) == NULL)
+					gs_app_list_add (merged, a);
+			}
+		}
+	}
+
+	/* 3. System path fallback — always add packages from /run/current-system/sw */
+	if (g_file_test ("/run/current-system/sw/bin", G_FILE_TEST_IS_DIR)) {
+		sys_path_list = list_system_path_packages (plugin, &path_error);
+		if (sys_path_list != NULL) {
+			for (i = 0; i < gs_app_list_length (sys_path_list); i++) {
+				GsApp *a = gs_app_list_index (sys_path_list, i);
+				/* Don't duplicate packages already from declarative system */
+				if (gs_app_list_lookup (merged, gs_app_get_unique_id (a)) == NULL)
+					gs_app_list_add (merged, a);
+			}
+		}
+	}
+}
+
 static void list_apps_communicate_cb (GObject *source_object, GAsyncResult *result, gpointer user_data);
 
 static void
@@ -871,6 +946,13 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 {
 	GsPluginNixos *self = GS_PLUGIN_NIXOS (plugin);
 	g_autoptr(GTask) task = gs_plugin_list_apps_data_new_task (plugin, query, flags, event_callback, event_user_data, cancellable, callback, user_data);
+	GsApp *alternate_of = NULL;
+	GsAppQueryTristate is_installed;
+	g_autoptr(GSubprocess) subprocess = NULL;
+	g_autoptr(GError) local_error = NULL;
+	ListAppsData *data = NULL;
+	g_autoptr(GsAppList) merged = NULL;
+
 	g_task_set_source_tag (task, gs_plugin_nixos_list_apps_async);
 
 	if (query == NULL) {
@@ -878,7 +960,7 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 		return;
 	}
 
-	GsApp *alternate_of = gs_app_query_get_alternate_of (query);
+	alternate_of = gs_app_query_get_alternate_of (query);
 	if (alternate_of != NULL) {
 		g_autoptr(GsAppList) list = gs_app_list_new ();
 		const gchar *app_id = gs_app_get_id (alternate_of);
@@ -911,87 +993,41 @@ gs_plugin_nixos_list_apps_async (GsPlugin              *plugin,
 		return;
 	}
 
-	GsAppQueryTristate is_installed = gs_app_query_get_is_installed (query);
+	is_installed = gs_app_query_get_is_installed (query);
 	if (is_installed != GS_APP_QUERY_TRISTATE_TRUE) {
 		g_task_return_pointer (task, gs_app_list_new (), g_object_unref);
 		return;
 	}
 
-	/* Hybrid mode: accumulate from ALL active backends */
-	g_autoptr(GsAppList) merged = gs_app_list_new ();
-
-	/* 1. System declarative (configuration.nix) */
-	if (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE &&
-	    self->declarative_system_file != NULL) {
-		g_autoptr(GError) local_error = NULL;
-		g_autoptr(GsAppList) sys_list = list_declarative_packages (plugin, self->declarative_system_file, &local_error);
-		if (sys_list != NULL) {
-			for (guint i = 0; i < gs_app_list_length (sys_list); i++) {
-				GsApp *a = gs_app_list_index (sys_list, i);
-				gs_app_set_metadata (a, "NixOS::install-source", "system");
-				gs_app_list_add (merged, a);
-			}
+	/* If we need user backend profile/env, query asynchronously */
+	if (self->user_backend == GS_NIXOS_BACKEND_PROFILE || self->user_backend == GS_NIXOS_BACKEND_ENV) {
+		if (self->user_backend == GS_NIXOS_BACKEND_ENV) {
+			subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+			                               &local_error,
+			                               "nix-env", "-q", "--json", NULL);
+		} else {
+			subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+			                               &local_error,
+			                               "nix", "profile", "list", "--json", NULL);
 		}
-	}
 
-	/* 2. User declarative (home-manager) */
-	if (self->user_backend == GS_NIXOS_BACKEND_DECLARATIVE &&
-	    self->declarative_user_file != NULL) {
-		g_autoptr(GError) local_error = NULL;
-		g_autoptr(GsAppList) user_list = list_declarative_packages (plugin, self->declarative_user_file, &local_error);
-		if (user_list != NULL) {
-			for (guint i = 0; i < gs_app_list_length (user_list); i++) {
-				GsApp *a = gs_app_list_index (user_list, i);
-				gs_app_set_metadata (a, "NixOS::install-source", "user");
-				gs_app_list_add (merged, a);
-			}
+		if (subprocess == NULL) {
+			g_task_return_error (task, g_steal_pointer (&local_error));
+			return;
 		}
-	}
 
-	/* 3. System path fallback — always add packages from /run/current-system/sw */
-	if (g_file_test ("/run/current-system/sw/bin", G_FILE_TEST_IS_DIR)) {
-		g_autoptr(GError) local_error = NULL;
-		g_autoptr(GsAppList) sys_path_list = list_system_path_packages (plugin, &local_error);
-		if (sys_path_list != NULL) {
-			for (guint i = 0; i < gs_app_list_length (sys_path_list); i++) {
-				GsApp *a = gs_app_list_index (sys_path_list, i);
-				/* Don't duplicate packages already from declarative system */
-				if (gs_app_list_lookup (merged, gs_app_get_unique_id (a)) == NULL)
-					gs_app_list_add (merged, a);
-			}
-		}
-	}
+		data = g_slice_new0 (ListAppsData);
+		data->subprocess = g_object_ref (subprocess);
+		data->self = self;
 
-	/* 4. If any declarative or system packages were found, return them */
-	if (gs_app_list_length (merged) > 0) {
-		g_task_return_pointer (task, g_steal_pointer (&merged), g_object_unref);
-		return;
-	}
-
-	/* 5. nix profile / nix-env fallback */
-	g_autoptr(GSubprocess) subprocess = NULL;
-	g_autoptr(GError) local_error = NULL;
-	if (self->user_backend == GS_NIXOS_BACKEND_ENV) {
-		subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
-		                               &local_error,
-		                               "nix-env", "-q", "--json", NULL);
+		g_task_set_task_data (task, data, (GDestroyNotify) list_apps_data_free);
+		g_subprocess_communicate_async (subprocess, NULL, cancellable, list_apps_communicate_cb, g_steal_pointer (&task));
 	} else {
-		subprocess = g_subprocess_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE,
-		                               &local_error,
-		                               "nix", "profile", "list", "--json", NULL);
+		/* Declarative or none user backend, list synchronously and return */
+		merged = gs_app_list_new ();
+		merge_declarative_and_system_packages (plugin, merged);
+		g_task_return_pointer (task, g_steal_pointer (&merged), g_object_unref);
 	}
-
-	if (subprocess == NULL) {
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
-	}
-
-	ListAppsData *data = g_slice_new0 (ListAppsData);
-	data->subprocess = g_object_ref (subprocess);
-	data->self = self;
-
-	g_task_set_task_data (task, data, (GDestroyNotify) list_apps_data_free);
-	g_subprocess_communicate_async (subprocess, NULL, cancellable, list_apps_communicate_cb, g_steal_pointer (&task));
 }
 
 static void
@@ -1002,17 +1038,18 @@ list_apps_communicate_cb (GObject *source_object, GAsyncResult *result, gpointer
 	ListAppsData *data = g_task_get_task_data (task);
 	g_autoptr(GError) local_error = NULL;
 	g_autoptr(GBytes) stdout_buf = NULL;
+	const gchar *output = NULL;
+	g_autoptr(GsAppList) list = NULL;
 
 	if (!g_subprocess_communicate_finish (subprocess, result, &stdout_buf, NULL, &local_error)) {
 		g_task_return_error (task, g_steal_pointer (&local_error));
 		return;
 	}
 
-	const gchar *output = g_bytes_get_data (stdout_buf, NULL);
+	output = g_bytes_get_data (stdout_buf, NULL);
 	if (output == NULL) output = "";
 
-	g_autoptr(GsAppList) list = NULL;
-	if (data->self->mode == GS_PLUGIN_NIXOS_MODE_NIX_PROFILE) {
+	if (data->self->user_backend == GS_NIXOS_BACKEND_PROFILE) {
 		list = parse_nix_profile_json (GS_PLUGIN (data->self), output, &local_error);
 	} else {
 		list = parse_nix_env_json (GS_PLUGIN (data->self), output, &local_error);
@@ -1021,6 +1058,8 @@ list_apps_communicate_cb (GObject *source_object, GAsyncResult *result, gpointer
 	if (list == NULL) {
 		g_task_return_error (task, g_steal_pointer (&local_error));
 	} else {
+		/* Merge with declarative & system path packages */
+		merge_declarative_and_system_packages (GS_PLUGIN (data->self), list);
 		g_task_return_pointer (task, g_steal_pointer (&list), g_object_unref);
 	}
 }
@@ -1288,6 +1327,314 @@ gs_plugin_nixos_install_apps_finish (GsPlugin *plugin, GAsyncResult *result, GEr
 	return g_task_propagate_boolean (G_TASK (result), error);
 }
 
+typedef struct {
+	GsPluginNixos *self;
+	GTask *task;
+	GCancellable *cancellable;
+	GsAppList *apps;
+
+	GsAppList *system_apps;
+	GsAppList *user_apps;
+	GsAppList *profile_apps;
+	GsAppList *env_apps;
+
+	gint step;
+} UninstallState;
+
+static void
+uninstall_state_free (UninstallState *state)
+{
+	g_clear_object (&state->task);
+	g_clear_object (&state->cancellable);
+	g_clear_object (&state->apps);
+	g_clear_object (&state->system_apps);
+	g_clear_object (&state->user_apps);
+	g_clear_object (&state->profile_apps);
+	g_clear_object (&state->env_apps);
+	g_slice_free (UninstallState, state);
+}
+
+static void uninstall_next_step (UninstallState *state);
+
+static void
+uninstall_command_communicate_cb (GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+	GSubprocess *subprocess = G_SUBPROCESS (source_object);
+	UninstallState *state = (UninstallState *) user_data;
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GBytes) stderr_buf = NULL;
+	guint i;
+
+	if (!g_subprocess_communicate_finish (subprocess, result, NULL, &stderr_buf, &local_error)) {
+		state->self->in_plugin_action = FALSE;
+		for (i = 0; i < gs_app_list_length (state->apps); i++) {
+			GsApp *app = gs_app_list_index (state->apps, i);
+			gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+		}
+		g_task_return_error (state->task, g_steal_pointer (&local_error));
+		uninstall_state_free (state);
+		return;
+	}
+
+	if (!g_subprocess_get_successful (subprocess)) {
+		const gchar *err_msg = stderr_buf ? g_bytes_get_data (stderr_buf, NULL) : "Unknown error";
+		state->self->in_plugin_action = FALSE;
+		for (i = 0; i < gs_app_list_length (state->apps); i++) {
+			GsApp *app = gs_app_list_index (state->apps, i);
+			gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+		}
+		g_task_return_new_error (state->task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "Nix command failed: %s", err_msg);
+		uninstall_state_free (state);
+		return;
+	}
+
+	state->step++;
+	uninstall_next_step (state);
+}
+
+static void
+uninstall_next_step (UninstallState *state)
+{
+	GsPluginNixos *self = state->self;
+	guint i;
+
+	if (state->step == 0) {
+		/* Step 0: System declarative apps */
+		if (gs_app_list_length (state->system_apps) > 0) {
+			g_autoptr(GPtrArray) packages = NULL;
+			g_autoptr(GPtrArray) argv = NULL;
+			g_autoptr(GError) local_error = NULL;
+			const gchar *tmp_file = "/tmp/gnome-software-packages.nix.tmp";
+			g_autofree gchar *flake_nix = NULL;
+			gboolean use_flake = FALSE;
+			g_autoptr(GSubprocess) subprocess = NULL;
+			guint j;
+
+			packages = parse_nix_file_packages (self->declarative_system_file);
+			argv = g_ptr_array_new_with_free_func (g_free);
+			flake_nix = g_build_filename (self->system_flake_dir, "flake.nix", NULL);
+			use_flake = g_file_test (flake_nix, G_FILE_TEST_EXISTS);
+
+			for (i = 0; i < gs_app_list_length (state->system_apps); i++) {
+				GsApp *app = gs_app_list_index (state->system_apps, i);
+				g_autofree gchar *pkg_name = guess_nix_package_name (app);
+				for (j = 0; j < packages->len; j++) {
+					if (g_strcmp0 (g_ptr_array_index (packages, j), pkg_name) == 0) {
+						g_ptr_array_remove_index (packages, j);
+						break;
+					}
+				}
+			}
+
+			if (!write_nix_file_packages (tmp_file, packages, FALSE, &local_error)) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				uninstall_state_free (state);
+				return;
+			}
+
+			g_ptr_array_add (argv, g_strdup ("pkexec"));
+			g_ptr_array_add (argv, g_strdup ("sh"));
+			g_ptr_array_add (argv, g_strdup ("-c"));
+			if (use_flake) {
+				g_ptr_array_add (argv, g_strdup_printf ("mv %s %s && nixos-rebuild switch --flake %s",
+				                                        tmp_file, self->declarative_system_file, self->system_flake_dir));
+			} else {
+				g_ptr_array_add (argv, g_strdup_printf ("mv %s %s && nixos-rebuild switch",
+				                                        tmp_file, self->declarative_system_file));
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				uninstall_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, uninstall_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	if (state->step == 1) {
+		/* Step 1: User declarative apps */
+		if (gs_app_list_length (state->user_apps) > 0) {
+			g_autoptr(GPtrArray) packages = NULL;
+			g_autoptr(GPtrArray) argv = NULL;
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+			guint j;
+
+			packages = parse_nix_file_packages (self->declarative_user_file);
+			argv = g_ptr_array_new_with_free_func (g_free);
+
+			for (i = 0; i < gs_app_list_length (state->user_apps); i++) {
+				GsApp *app = gs_app_list_index (state->user_apps, i);
+				g_autofree gchar *pkg_name = guess_nix_package_name (app);
+				for (j = 0; j < packages->len; j++) {
+					if (g_strcmp0 (g_ptr_array_index (packages, j), pkg_name) == 0) {
+						g_ptr_array_remove_index (packages, j);
+						break;
+					}
+				}
+			}
+
+			if (!write_nix_file_packages (self->declarative_user_file, packages, TRUE, &local_error)) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				uninstall_state_free (state);
+				return;
+			}
+
+			g_ptr_array_add (argv, g_strdup ("home-manager"));
+			g_ptr_array_add (argv, g_strdup ("switch"));
+			if (self->use_flakes && self->home_manager_flake_dir != NULL) {
+				g_ptr_array_add (argv, g_strdup ("--flake"));
+				g_ptr_array_add (argv, g_strdup (self->home_manager_flake_dir));
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				uninstall_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, uninstall_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	if (state->step == 2) {
+		/* Step 2: Nix profile apps */
+		if (gs_app_list_length (state->profile_apps) > 0) {
+			g_autoptr(GPtrArray) argv = NULL;
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+
+			argv = g_ptr_array_new_with_free_func (g_free);
+			g_ptr_array_add (argv, g_strdup ("nix"));
+			g_ptr_array_add (argv, g_strdup ("profile"));
+			g_ptr_array_add (argv, g_strdup ("remove"));
+			for (i = 0; i < gs_app_list_length (state->profile_apps); i++) {
+				GsApp *app = gs_app_list_index (state->profile_apps, i);
+				const gchar *name = gs_app_get_id (app);
+				gboolean is_numeric = TRUE;
+				const gchar *p;
+				for (p = name; p != NULL && *p != '\0'; p++) {
+					if (!g_ascii_isdigit (*p)) {
+						is_numeric = FALSE;
+						break;
+					}
+				}
+				if (is_numeric) {
+					g_ptr_array_add (argv, g_strdup (name));
+				} else {
+					g_autofree gchar *pkg_name = guess_nix_package_name (app);
+					gchar *idx = get_nix_profile_index_by_package_name (self, pkg_name);
+					if (idx != NULL) {
+						g_ptr_array_add (argv, idx);
+					} else {
+						g_ptr_array_add (argv, g_strdup (pkg_name));
+					}
+				}
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				uninstall_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, uninstall_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	if (state->step == 3) {
+		/* Step 3: Nix env apps */
+		if (gs_app_list_length (state->env_apps) > 0) {
+			g_autoptr(GPtrArray) argv = NULL;
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+
+			argv = g_ptr_array_new_with_free_func (g_free);
+			g_ptr_array_add (argv, g_strdup ("nix-env"));
+			g_ptr_array_add (argv, g_strdup ("-e"));
+			for (i = 0; i < gs_app_list_length (state->env_apps); i++) {
+				GsApp *app = gs_app_list_index (state->env_apps, i);
+				g_autofree gchar *pkg_name = guess_nix_package_name (app);
+				g_ptr_array_add (argv, g_strdup (pkg_name));
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				uninstall_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, uninstall_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	/* All steps completed successfully */
+	self->in_plugin_action = FALSE;
+	for (i = 0; i < gs_app_list_length (state->apps); i++) {
+		GsApp *app = gs_app_list_index (state->apps, i);
+		gs_app_set_state (app, GS_APP_STATE_AVAILABLE);
+	}
+	g_task_return_boolean (state->task, TRUE);
+	uninstall_state_free (state);
+}
+
 static void
 gs_plugin_nixos_uninstall_apps_async (GsPlugin                             *plugin,
                                       GsAppList                            *apps,
@@ -1304,16 +1651,25 @@ gs_plugin_nixos_uninstall_apps_async (GsPlugin                             *plug
 {
 	GsPluginNixos *self = GS_PLUGIN_NIXOS (plugin);
 	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	g_autoptr(GSettings) settings = NULL;
+	UninstallState *state = NULL;
+	gboolean has_system;
+	gboolean has_user;
+	gboolean has_profile;
+	gboolean has_env;
+	guint i;
+
 	g_task_set_source_tag (task, gs_plugin_nixos_uninstall_apps_async);
 
 	self->in_plugin_action = TRUE;
 	load_config (self);
 
-	g_autoptr(GSettings) settings = g_settings_new ("org.gnome.software");
-	for (guint i = 0; i < gs_app_list_length (apps); i++) {
+	settings = g_settings_new ("org.gnome.software");
+	for (i = 0; i < gs_app_list_length (apps); i++) {
 		GsApp *app = gs_app_list_index (apps, i);
 		g_autofree gchar *pkg_name = guess_nix_package_name (app);
-		for (guint j = 0; j < G_N_ELEMENTS (special_options); j++) {
+		guint j;
+		for (j = 0; j < G_N_ELEMENTS (special_options); j++) {
 			if (g_strcmp0 (pkg_name, special_options[j].package_name) == 0) {
 				g_autofree gchar *key = g_strdup_printf ("nixos-option-%s", pkg_name);
 				g_settings_set_boolean (settings, key, FALSE);
@@ -1322,145 +1678,308 @@ gs_plugin_nixos_uninstall_apps_async (GsPlugin                             *plug
 		}
 	}
 
-	g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
-	gboolean use_pkexec = FALSE;
-
-	for (guint i = 0; i < gs_app_list_length (apps); i++) {
+	for (i = 0; i < gs_app_list_length (apps); i++) {
 		GsApp *app = gs_app_list_index (apps, i);
 		gs_app_set_state (app, GS_APP_STATE_REMOVING);
 	}
 
-	if (self->mode == GS_PLUGIN_NIXOS_MODE_NIX_PROFILE) {
-		g_ptr_array_add (argv, g_strdup ("nix"));
-		g_ptr_array_add (argv, g_strdup ("profile"));
-		g_ptr_array_add (argv, g_strdup ("remove"));
-		for (guint i = 0; i < gs_app_list_length (apps); i++) {
-			GsApp *app = gs_app_list_index (apps, i);
-			const gchar *name = gs_app_get_id (app);
-			gboolean is_numeric = TRUE;
-			for (const gchar *p = name; *p != '\0'; p++) {
-				if (!g_ascii_isdigit (*p)) {
-					is_numeric = FALSE;
-					break;
-				}
-			}
-			if (is_numeric) {
-				g_ptr_array_add (argv, g_strdup (name));
-			} else {
-				g_autofree gchar *pkg_name = guess_nix_package_name (app);
-				gchar *idx = get_nix_profile_index_by_package_name (self, pkg_name);
-				if (idx != NULL) {
-					g_ptr_array_add (argv, idx);
-				} else {
-					g_ptr_array_add (argv, g_strdup (pkg_name));
-				}
-			}
-		}
-		g_ptr_array_add (argv, NULL);
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_NIX_ENV) {
-		g_ptr_array_add (argv, g_strdup ("nix-env"));
-		g_ptr_array_add (argv, g_strdup ("-e"));
-		for (guint i = 0; i < gs_app_list_length (apps); i++) {
-			GsApp *app = gs_app_list_index (apps, i);
-			g_autofree gchar *pkg_name = guess_nix_package_name (app);
-			g_ptr_array_add (argv, g_strdup (pkg_name));
-		}
-		g_ptr_array_add (argv, NULL);
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_SYSTEM) {
-		g_autoptr(GError) local_error = NULL;
-		g_autoptr(GPtrArray) packages = parse_nix_file_packages (self->declarative_system_file);
-		for (guint i = 0; i < gs_app_list_length (apps); i++) {
-			GsApp *app = gs_app_list_index (apps, i);
-			g_autofree gchar *pkg_name = guess_nix_package_name (app);
-			for (guint j = 0; j < packages->len; j++) {
-				if (g_strcmp0 (g_ptr_array_index (packages, j), pkg_name) == 0) {
-					g_ptr_array_remove_index (packages, j);
-					break;
-				}
-			}
+	has_system = (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE);
+	has_user   = (self->user_backend   == GS_NIXOS_BACKEND_DECLARATIVE);
+	has_profile = (self->user_backend  == GS_NIXOS_BACKEND_PROFILE);
+	has_env    = (self->user_backend   == GS_NIXOS_BACKEND_ENV);
+
+	state = g_slice_new0 (UninstallState);
+	state->self = self;
+	state->task = g_object_ref (task);
+	state->cancellable = (cancellable != NULL) ? g_object_ref (cancellable) : NULL;
+	state->apps = g_object_ref (apps);
+	state->system_apps = gs_app_list_new ();
+	state->user_apps = gs_app_list_new ();
+	state->profile_apps = gs_app_list_new ();
+	state->env_apps = gs_app_list_new ();
+	state->step = 0;
+
+	for (i = 0; i < gs_app_list_length (apps); i++) {
+		GsApp *app = gs_app_list_index (apps, i);
+		g_autofree gchar *pkg_name = guess_nix_package_name (app);
+		const gchar *src = gs_app_get_metadata_item (app, "NixOS::install-source");
+		if (src == NULL) {
+			src = detect_package_install_source (self, pkg_name);
 		}
 
-		const gchar *tmp_file = "/tmp/gnome-software-packages.nix.tmp";
-		if (!write_nix_file_packages (tmp_file, packages, FALSE, &local_error)) {
-			g_task_return_error (task, g_steal_pointer (&local_error));
-			return;
-		}
-
-		g_autofree gchar *flake_nix = g_build_filename (self->system_flake_dir, "flake.nix", NULL);
-		gboolean use_flake = g_file_test (flake_nix, G_FILE_TEST_EXISTS);
-
-		use_pkexec = TRUE;
-		g_ptr_array_add (argv, g_strdup ("sh"));
-		g_ptr_array_add (argv, g_strdup ("-c"));
-		if (use_flake) {
-			g_ptr_array_add (argv, g_strdup_printf ("mv %s %s && nixos-rebuild switch --flake %s",
-			                                        tmp_file, self->declarative_system_file, self->system_flake_dir));
-		} else {
-			g_ptr_array_add (argv, g_strdup_printf ("mv %s %s && nixos-rebuild switch",
-			                                        tmp_file, self->declarative_system_file));
-		}
-		g_ptr_array_add (argv, NULL);
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_USER) {
-		g_autoptr(GError) local_error = NULL;
-		g_autoptr(GPtrArray) packages = parse_nix_file_packages (self->declarative_user_file);
-		for (guint i = 0; i < gs_app_list_length (apps); i++) {
-			GsApp *app = gs_app_list_index (apps, i);
-			g_autofree gchar *pkg_name = guess_nix_package_name (app);
-			for (guint j = 0; j < packages->len; j++) {
-				if (g_strcmp0 (g_ptr_array_index (packages, j), pkg_name) == 0) {
-					g_ptr_array_remove_index (packages, j);
-					break;
-				}
-			}
-		}
-
-		if (!write_nix_file_packages (self->declarative_user_file, packages, TRUE, &local_error)) {
-			g_task_return_error (task, g_steal_pointer (&local_error));
-			return;
-		}
-
-		g_ptr_array_add (argv, g_strdup ("home-manager"));
-		g_ptr_array_add (argv, g_strdup ("switch"));
-		g_ptr_array_add (argv, NULL);
+		if (g_strcmp0 (src, "system") == 0 && has_system)
+			gs_app_list_add (state->system_apps, app);
+		else if (g_strcmp0 (src, "user") == 0 && has_user)
+			gs_app_list_add (state->user_apps, app);
+		else if (g_strcmp0 (src, "env") == 0 || has_env)
+			gs_app_list_add (state->env_apps, app);
+		else if (has_profile)
+			gs_app_list_add (state->profile_apps, app);
+		else if (has_system)
+			gs_app_list_add (state->system_apps, app);
+		else
+			gs_app_list_add (state->profile_apps, app);
 	}
 
-	g_autoptr(GSubprocess) subprocess = NULL;
-	g_autoptr(GError) local_error = NULL;
-	gchar **cmd_argv = (gchar **) argv->pdata;
-	g_auto(GStrv) pkexec_argv = NULL;
-
-	if (use_pkexec) {
-		guint len = argv->len - 1;
-		pkexec_argv = g_new0 (gchar *, len + 2);
-		pkexec_argv[0] = g_strdup ("pkexec");
-		for (guint i = 0; i < len; i++) {
-			pkexec_argv[i+1] = g_strdup (cmd_argv[i]);
-		}
-		pkexec_argv[len+1] = NULL;
-		cmd_argv = pkexec_argv;
-	}
-
-	subprocess = g_subprocess_newv ((const gchar * const *) cmd_argv,
-	                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
-	                                &local_error);
-
-	if (subprocess == NULL) {
-		for (guint i = 0; i < gs_app_list_length (apps); i++) {
-			GsApp *app = gs_app_list_index (apps, i);
-			gs_app_set_state (app, GS_APP_STATE_INSTALLED);
-		}
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
-	}
-
-	g_task_set_task_data (task, g_object_ref (subprocess), g_object_unref);
-	g_subprocess_communicate_async (subprocess, NULL, cancellable, command_communicate_cb, g_steal_pointer (&task));
+	uninstall_next_step (state);
 }
 
 static gboolean
 gs_plugin_nixos_uninstall_apps_finish (GsPlugin *plugin, GAsyncResult *result, GError **error)
 {
 	return g_task_propagate_boolean (G_TASK (result), error);
+}
+
+typedef struct {
+	GsPluginNixos *self;
+	GTask *task;
+	GCancellable *cancellable;
+	GsAppList *apps;
+
+	GsAppList *system_apps;
+	GsAppList *user_apps;
+	GsAppList *profile_apps;
+	GsAppList *env_apps;
+
+	gint step;
+} UpdateState;
+
+static void
+update_state_free (UpdateState *state)
+{
+	g_clear_object (&state->task);
+	g_clear_object (&state->cancellable);
+	g_clear_object (&state->apps);
+	g_clear_object (&state->system_apps);
+	g_clear_object (&state->user_apps);
+	g_clear_object (&state->profile_apps);
+	g_clear_object (&state->env_apps);
+	g_slice_free (UpdateState, state);
+}
+
+static void update_next_step (UpdateState *state);
+
+static void
+update_command_communicate_cb (GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+	GSubprocess *subprocess = G_SUBPROCESS (source_object);
+	UpdateState *state = (UpdateState *) user_data;
+	g_autoptr(GError) local_error = NULL;
+	g_autoptr(GBytes) stderr_buf = NULL;
+	guint i;
+
+	if (!g_subprocess_communicate_finish (subprocess, result, NULL, &stderr_buf, &local_error)) {
+		state->self->in_plugin_action = FALSE;
+		for (i = 0; i < gs_app_list_length (state->apps); i++) {
+			GsApp *app = gs_app_list_index (state->apps, i);
+			gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
+		}
+		g_task_return_error (state->task, g_steal_pointer (&local_error));
+		update_state_free (state);
+		return;
+	}
+
+	if (!g_subprocess_get_successful (subprocess)) {
+		const gchar *err_msg = stderr_buf ? g_bytes_get_data (stderr_buf, NULL) : "Unknown error";
+		state->self->in_plugin_action = FALSE;
+		for (i = 0; i < gs_app_list_length (state->apps); i++) {
+			GsApp *app = gs_app_list_index (state->apps, i);
+			gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
+		}
+		g_task_return_new_error (state->task, GS_PLUGIN_ERROR, GS_PLUGIN_ERROR_FAILED,
+		                         "Nix command failed: %s", err_msg);
+		update_state_free (state);
+		return;
+	}
+
+	state->step++;
+	update_next_step (state);
+}
+
+static void
+update_next_step (UpdateState *state)
+{
+	GsPluginNixos *self = state->self;
+	guint i;
+
+	if (state->step == 0) {
+		/* Step 0: System declarative apps update */
+		gboolean run_system = (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE) &&
+		                      (gs_app_list_length (state->apps) == 0 || gs_app_list_length (state->system_apps) > 0);
+
+		if (run_system) {
+			g_autofree gchar *flake_nix = g_build_filename (self->system_flake_dir, "flake.nix", NULL);
+			gboolean use_flake = g_file_test (flake_nix, G_FILE_TEST_EXISTS);
+			g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+
+			g_ptr_array_add (argv, g_strdup ("pkexec"));
+			g_ptr_array_add (argv, g_strdup ("sh"));
+			g_ptr_array_add (argv, g_strdup ("-c"));
+			if (use_flake) {
+				g_ptr_array_add (argv, g_strdup_printf ("nix flake update --flake %s && nixos-rebuild switch --flake %s",
+				                                        self->system_flake_dir, self->system_flake_dir));
+			} else {
+				g_ptr_array_add (argv, g_strdup ("nix-channel --update nixos && nixos-rebuild switch"));
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				update_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, update_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	if (state->step == 1) {
+		/* Step 1: User declarative apps update */
+		gboolean run_user = (self->user_backend == GS_NIXOS_BACKEND_DECLARATIVE) &&
+		                    (gs_app_list_length (state->apps) == 0 || gs_app_list_length (state->user_apps) > 0);
+
+		if (run_user) {
+			g_autofree gchar *flake_nix = g_build_filename (self->home_manager_flake_dir, "flake.nix", NULL);
+			gboolean use_flake = g_file_test (flake_nix, G_FILE_TEST_EXISTS);
+			g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+
+			g_ptr_array_add (argv, g_strdup ("sh"));
+			g_ptr_array_add (argv, g_strdup ("-c"));
+			if (use_flake) {
+				g_ptr_array_add (argv, g_strdup_printf ("nix flake update --flake %s && home-manager switch",
+				                                        self->home_manager_flake_dir));
+			} else {
+				g_ptr_array_add (argv, g_strdup ("nix-channel --update && home-manager switch"));
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				update_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, update_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	if (state->step == 2) {
+		/* Step 2: Nix profile apps update */
+		gboolean run_profile = (self->user_backend == GS_NIXOS_BACKEND_PROFILE) &&
+		                       (gs_app_list_length (state->apps) == 0 || gs_app_list_length (state->profile_apps) > 0);
+
+		if (run_profile) {
+			g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+
+			g_ptr_array_add (argv, g_strdup ("nix"));
+			g_ptr_array_add (argv, g_strdup ("profile"));
+			g_ptr_array_add (argv, g_strdup ("upgrade"));
+			if (gs_app_list_length (state->profile_apps) > 0) {
+				for (i = 0; i < gs_app_list_length (state->profile_apps); i++) {
+					GsApp *app = gs_app_list_index (state->profile_apps, i);
+					const gchar *name = gs_app_get_id (app);
+					g_ptr_array_add (argv, g_strdup (name));
+				}
+			} else {
+				g_ptr_array_add (argv, g_strdup ("--all"));
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				update_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, update_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	if (state->step == 3) {
+		/* Step 3: Nix env apps update */
+		gboolean run_env = (self->user_backend == GS_NIXOS_BACKEND_ENV) &&
+		                   (gs_app_list_length (state->apps) == 0 || gs_app_list_length (state->env_apps) > 0);
+
+		if (run_env) {
+			g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
+			g_autoptr(GError) local_error = NULL;
+			g_autoptr(GSubprocess) subprocess = NULL;
+
+			g_ptr_array_add (argv, g_strdup ("nix-env"));
+			g_ptr_array_add (argv, g_strdup ("-u"));
+			if (gs_app_list_length (state->env_apps) > 0) {
+				for (i = 0; i < gs_app_list_length (state->env_apps); i++) {
+					GsApp *app = gs_app_list_index (state->env_apps, i);
+					const gchar *name = gs_app_get_id (app);
+					g_ptr_array_add (argv, g_strdup (name));
+				}
+			}
+			g_ptr_array_add (argv, NULL);
+
+			subprocess = g_subprocess_newv ((const gchar * const *) argv->pdata,
+			                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
+			                                &local_error);
+			if (subprocess == NULL) {
+				self->in_plugin_action = FALSE;
+				for (i = 0; i < gs_app_list_length (state->apps); i++) {
+					GsApp *app = gs_app_list_index (state->apps, i);
+					gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
+				}
+				g_task_return_error (state->task, g_steal_pointer (&local_error));
+				update_state_free (state);
+				return;
+			}
+
+			g_subprocess_communicate_async (subprocess, NULL, state->cancellable, update_command_communicate_cb, state);
+			return;
+		}
+		state->step++;
+	}
+
+	/* All steps completed successfully */
+	self->in_plugin_action = FALSE;
+	for (i = 0; i < gs_app_list_length (state->apps); i++) {
+		GsApp *app = gs_app_list_index (state->apps, i);
+		gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+	}
+	g_task_return_boolean (state->task, TRUE);
+	update_state_free (state);
 }
 
 static void
@@ -1479,104 +1998,62 @@ gs_plugin_nixos_update_apps_async (GsPlugin                           *plugin,
 {
 	GsPluginNixos *self = GS_PLUGIN_NIXOS (plugin);
 	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	UpdateState *state = NULL;
+	gboolean has_system;
+	gboolean has_user;
+	gboolean has_profile;
+	gboolean has_env;
+	guint i;
+
 	g_task_set_source_tag (task, gs_plugin_nixos_update_apps_async);
 
 	self->in_plugin_action = TRUE;
 	load_config (self);
 
-	g_autoptr(GPtrArray) argv = g_ptr_array_new_with_free_func (g_free);
-	gboolean use_pkexec = FALSE;
-
-	for (guint i = 0; i < gs_app_list_length (apps); i++) {
+	for (i = 0; i < gs_app_list_length (apps); i++) {
 		GsApp *app = gs_app_list_index (apps, i);
 		gs_app_set_state (app, GS_APP_STATE_INSTALLING);
 	}
 
-	if (self->mode == GS_PLUGIN_NIXOS_MODE_NIX_PROFILE) {
-		g_ptr_array_add (argv, g_strdup ("nix"));
-		g_ptr_array_add (argv, g_strdup ("profile"));
-		g_ptr_array_add (argv, g_strdup ("upgrade"));
-		if (gs_app_list_length (apps) > 0) {
-			for (guint i = 0; i < gs_app_list_length (apps); i++) {
-				GsApp *app = gs_app_list_index (apps, i);
-				const gchar *name = gs_app_get_id (app);
-				g_ptr_array_add (argv, g_strdup (name));
-			}
-		} else {
-			g_ptr_array_add (argv, g_strdup ("--all"));
-		}
-		g_ptr_array_add (argv, NULL);
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_NIX_ENV) {
-		g_ptr_array_add (argv, g_strdup ("nix-env"));
-		g_ptr_array_add (argv, g_strdup ("-u"));
-		if (gs_app_list_length (apps) > 0) {
-			for (guint i = 0; i < gs_app_list_length (apps); i++) {
-				GsApp *app = gs_app_list_index (apps, i);
-				const gchar *name = gs_app_get_id (app);
-				g_ptr_array_add (argv, g_strdup (name));
-			}
-		}
-		g_ptr_array_add (argv, NULL);
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_SYSTEM) {
-		g_autofree gchar *flake_nix = g_build_filename (self->system_flake_dir, "flake.nix", NULL);
-		gboolean use_flake = g_file_test (flake_nix, G_FILE_TEST_EXISTS);
+	has_system = (self->system_backend == GS_NIXOS_BACKEND_DECLARATIVE);
+	has_user   = (self->user_backend   == GS_NIXOS_BACKEND_DECLARATIVE);
+	has_profile = (self->user_backend  == GS_NIXOS_BACKEND_PROFILE);
+	has_env    = (self->user_backend   == GS_NIXOS_BACKEND_ENV);
 
-		use_pkexec = TRUE;
-		g_ptr_array_add (argv, g_strdup ("sh"));
-		g_ptr_array_add (argv, g_strdup ("-c"));
-		if (use_flake) {
-			g_ptr_array_add (argv, g_strdup_printf ("nix flake update --flake %s && nixos-rebuild switch --flake %s",
-			                                        self->system_flake_dir, self->system_flake_dir));
-		} else {
-			g_ptr_array_add (argv, g_strdup ("nix-channel --update nixos && nixos-rebuild switch"));
-		}
-		g_ptr_array_add (argv, NULL);
-	} else if (self->mode == GS_PLUGIN_NIXOS_MODE_DECLARATIVE_USER) {
-		g_autofree gchar *flake_nix = g_build_filename (self->home_manager_flake_dir, "flake.nix", NULL);
-		gboolean use_flake = g_file_test (flake_nix, G_FILE_TEST_EXISTS);
+	state = g_slice_new0 (UpdateState);
+	state->self = self;
+	state->task = g_object_ref (task);
+	state->cancellable = (cancellable != NULL) ? g_object_ref (cancellable) : NULL;
+	state->apps = g_object_ref (apps);
+	state->system_apps = gs_app_list_new ();
+	state->user_apps = gs_app_list_new ();
+	state->profile_apps = gs_app_list_new ();
+	state->env_apps = gs_app_list_new ();
+	state->step = 0;
 
-		g_ptr_array_add (argv, g_strdup ("sh"));
-		g_ptr_array_add (argv, g_strdup ("-c"));
-		if (use_flake) {
-			g_ptr_array_add (argv, g_strdup_printf ("nix flake update --flake %s && home-manager switch",
-			                                        self->home_manager_flake_dir));
-		} else {
-			g_ptr_array_add (argv, g_strdup ("nix-channel --update && home-manager switch"));
+	for (i = 0; i < gs_app_list_length (apps); i++) {
+		GsApp *app = gs_app_list_index (apps, i);
+		g_autofree gchar *pkg_name = guess_nix_package_name (app);
+		const gchar *src = gs_app_get_metadata_item (app, "NixOS::install-source");
+		if (src == NULL) {
+			src = detect_package_install_source (self, pkg_name);
 		}
-		g_ptr_array_add (argv, NULL);
+
+		if (g_strcmp0 (src, "system") == 0 && has_system)
+			gs_app_list_add (state->system_apps, app);
+		else if (g_strcmp0 (src, "user") == 0 && has_user)
+			gs_app_list_add (state->user_apps, app);
+		else if (g_strcmp0 (src, "env") == 0 || has_env)
+			gs_app_list_add (state->env_apps, app);
+		else if (has_profile)
+			gs_app_list_add (state->profile_apps, app);
+		else if (has_system)
+			gs_app_list_add (state->system_apps, app);
+		else
+			gs_app_list_add (state->profile_apps, app);
 	}
 
-	g_autoptr(GSubprocess) subprocess = NULL;
-	g_autoptr(GError) local_error = NULL;
-	gchar **cmd_argv = (gchar **) argv->pdata;
-	g_auto(GStrv) pkexec_argv = NULL;
-
-	if (use_pkexec) {
-		guint len = argv->len - 1;
-		pkexec_argv = g_new0 (gchar *, len + 2);
-		pkexec_argv[0] = g_strdup ("pkexec");
-		for (guint i = 0; i < len; i++) {
-			pkexec_argv[i+1] = g_strdup (cmd_argv[i]);
-		}
-		pkexec_argv[len+1] = NULL;
-		cmd_argv = pkexec_argv;
-	}
-
-	subprocess = g_subprocess_newv ((const gchar * const *) cmd_argv,
-	                                G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE,
-	                                &local_error);
-
-	if (subprocess == NULL) {
-		for (guint i = 0; i < gs_app_list_length (apps); i++) {
-			GsApp *app = gs_app_list_index (apps, i);
-			gs_app_set_state (app, GS_APP_STATE_UPDATABLE);
-		}
-		g_task_return_error (task, g_steal_pointer (&local_error));
-		return;
-	}
-
-	g_task_set_task_data (task, g_object_ref (subprocess), g_object_unref);
-	g_subprocess_communicate_async (subprocess, NULL, cancellable, command_communicate_cb, g_steal_pointer (&task));
+	update_next_step (state);
 }
 
 static gboolean
@@ -1598,24 +2075,30 @@ gs_plugin_nixos_refine_async (GsPlugin                   *plugin,
 {
 	GsPluginNixos *self = GS_PLUGIN_NIXOS (plugin);
 	g_autoptr(GTask) task = g_task_new (plugin, cancellable, callback, user_data);
+	guint i;
+
 	g_task_set_source_tag (task, gs_plugin_nixos_refine_async);
 
 	load_config (self);
 
-	for (guint i = 0; i < gs_app_list_length (list); i++) {
+	for (i = 0; i < gs_app_list_length (list); i++) {
 		GsApp *app = gs_app_list_index (list, i);
+		g_autofree gchar *pkg_name = NULL;
+		const gchar *install_src = NULL;
+
 		if (!gs_app_has_management_plugin (app, plugin))
 			continue;
 
-		g_autofree gchar *pkg_name = guess_nix_package_name (app);
+		pkg_name = guess_nix_package_name (app);
 		if (pkg_name == NULL)
 			continue;
 
 		/* Refine state */
-		gboolean installed = is_package_installed (self, pkg_name);
-		if (installed) {
+		install_src = detect_package_install_source (self, pkg_name);
+		if (install_src != NULL) {
 			if (gs_app_get_state (app) != GS_APP_STATE_INSTALLED)
 				gs_app_set_state (app, GS_APP_STATE_INSTALLED);
+			gs_app_set_metadata (app, "NixOS::install-source", install_src);
 		} else {
 			if (gs_app_get_state (app) != GS_APP_STATE_AVAILABLE)
 				gs_app_set_state (app, GS_APP_STATE_AVAILABLE);

@@ -346,9 +346,18 @@ nixos_dialog_closed_cb (AdwDialog *dialog, gpointer user_data)
 	NixosInstallHelper *helper = user_data;
 	GsNixosSourceDialog *src_dialog = GS_NIXOS_SOURCE_DIALOG (dialog);
 	GsNixosInstallSource source = gs_nixos_source_dialog_get_source (src_dialog);
+	g_autoptr(GError) error_local = NULL;
+	GsPagePrivate *priv = NULL;
+	g_autoptr(GsAppQuery) query = NULL;
+	g_autoptr(GsPluginJob) job = NULL;
+	g_autoptr(GError) local_error = NULL;
+	GsAppList *alternates = NULL;
+	GsApp *flatpak_app = NULL;
+	GsApp *nixos_app = NULL;
+	g_autoptr(GsPlugin) app_plugin = NULL;
+	guint i;
 
 	if (source == GS_NIXOS_INSTALL_SOURCE_NONE) {
-		g_autoptr(GError) error_local = NULL;
 		/* User cancelled */
 		g_set_error_literal (&error_local, G_IO_ERROR, G_IO_ERROR_CANCELLED, _("User declined installation"));
 		gs_application_emit_install_resources_done (GS_APPLICATION (g_application_get_default ()), NULL, error_local);
@@ -361,47 +370,82 @@ nixos_dialog_closed_cb (AdwDialog *dialog, gpointer user_data)
 	}
 
 	if (source == GS_NIXOS_INSTALL_SOURCE_FLATPAK) {
-		/* Find the flatpak alternate */
-		GsPagePrivate *priv = gs_page_get_instance_private (helper->page);
-		g_autoptr(GsAppQuery) query = gs_app_query_new ("alternate-of", helper->app, NULL);
-		g_autoptr(GsPluginJob) job = gs_plugin_job_list_apps_new (query, GS_PLUGIN_LIST_APPS_FLAGS_INTERACTIVE);
-		g_autoptr(GError) local_error = NULL;
-		GsAppList *alternates = NULL;
-		GsApp *flatpak_app = NULL;
-		guint i;
-
-		/* We query alternates again (sync/local since it's cached, or just list) */
-		if (gs_plugin_loader_job_process (priv->plugin_loader, job, helper->cancellable, &local_error)) {
-			alternates = gs_plugin_job_list_apps_get_result_list (GS_PLUGIN_JOB_LIST_APPS (job));
-			for (i = 0; alternates != NULL && i < gs_app_list_length (alternates); i++) {
-				GsApp *alt = gs_app_list_index (alternates, i);
-				if (gs_app_get_bundle_kind (alt) == AS_BUNDLE_KIND_FLATPAK) {
-					flatpak_app = alt;
-					break;
+		app_plugin = gs_app_dup_management_plugin (helper->app);
+		if (app_plugin != NULL && g_strcmp0 (gs_plugin_get_name (app_plugin), "flatpak") == 0) {
+			flatpak_app = helper->app;
+		}
+		if (flatpak_app == NULL) {
+			priv = gs_page_get_instance_private (helper->page);
+			query = gs_app_query_new ("alternate-of", helper->app, NULL);
+			job = gs_plugin_job_list_apps_new (query, GS_PLUGIN_LIST_APPS_FLAGS_INTERACTIVE);
+			if (gs_plugin_loader_job_process (priv->plugin_loader, job, helper->cancellable, &local_error)) {
+				alternates = gs_plugin_job_list_apps_get_result_list (GS_PLUGIN_JOB_LIST_APPS (job));
+				for (i = 0; alternates != NULL && i < gs_app_list_length (alternates); i++) {
+					GsApp *alt = gs_app_list_index (alternates, i);
+					g_autoptr(GsPlugin) alt_plugin = gs_app_dup_management_plugin (alt);
+					if (alt_plugin != NULL && g_strcmp0 (gs_plugin_get_name (alt_plugin), "flatpak") == 0) {
+						flatpak_app = alt;
+						break;
+					}
 				}
 			}
-			if (flatpak_app != NULL) {
-				gs_page_install_app (helper->page, flatpak_app, helper->interaction, helper->cancellable);
-				nixos_install_helper_free (helper);
-				return;
+		}
+		if (flatpak_app != NULL) {
+			gs_app_set_metadata (flatpak_app, "NixOS::install-source", "flatpak");
+			gs_page_install_app (helper->page, flatpak_app, helper->interaction, helper->cancellable);
+		} else {
+			g_warning ("Flatpak alternate not found");
+			if (gs_app_get_state (helper->app) == GS_APP_STATE_INSTALLING) {
+				gs_app_set_state (helper->app, GS_APP_STATE_AVAILABLE);
+			}
+		}
+		nixos_install_helper_free (helper);
+		return;
+	} else {
+		/* NixOS sources */
+		app_plugin = gs_app_dup_management_plugin (helper->app);
+		if (app_plugin != NULL && g_strcmp0 (gs_plugin_get_name (app_plugin), "nixos") == 0) {
+			nixos_app = helper->app;
+		}
+		if (nixos_app == NULL) {
+			priv = gs_page_get_instance_private (helper->page);
+			query = gs_app_query_new ("alternate-of", helper->app, NULL);
+			job = gs_plugin_job_list_apps_new (query, GS_PLUGIN_LIST_APPS_FLAGS_INTERACTIVE);
+			if (gs_plugin_loader_job_process (priv->plugin_loader, job, helper->cancellable, &local_error)) {
+				alternates = gs_plugin_job_list_apps_get_result_list (GS_PLUGIN_JOB_LIST_APPS (job));
+				for (i = 0; alternates != NULL && i < gs_app_list_length (alternates); i++) {
+					GsApp *alt = gs_app_list_index (alternates, i);
+					g_autoptr(GsPlugin) alt_plugin = gs_app_dup_management_plugin (alt);
+					if (alt_plugin != NULL && g_strcmp0 (gs_plugin_get_name (alt_plugin), "nixos") == 0) {
+						nixos_app = alt;
+						break;
+					}
+				}
 			}
 		}
 
-		/* Fallback if flatpak alternate not found */
-		g_warning ("Flatpak alternate not found, falling back to Nix profile");
-		gs_app_set_metadata (helper->app, "NixOS::install-source", "profile");
-	} else if (source == GS_NIXOS_INSTALL_SOURCE_SYSTEM) {
-		gs_app_set_metadata (helper->app, "NixOS::install-source", "system");
-	} else if (source == GS_NIXOS_INSTALL_SOURCE_USER) {
-		gs_app_set_metadata (helper->app, "NixOS::install-source", "user");
-	} else if (source == GS_NIXOS_INSTALL_SOURCE_PROFILE) {
-		gs_app_set_metadata (helper->app, "NixOS::install-source", "profile");
-	} else if (source == GS_NIXOS_INSTALL_SOURCE_ENV) {
-		gs_app_set_metadata (helper->app, "NixOS::install-source", "env");
-	}
+		if (nixos_app != NULL) {
+			const gchar *src_meta = NULL;
+			if (source == GS_NIXOS_INSTALL_SOURCE_SYSTEM)
+				src_meta = "system";
+			else if (source == GS_NIXOS_INSTALL_SOURCE_USER)
+				src_meta = "user";
+			else if (source == GS_NIXOS_INSTALL_SOURCE_PROFILE)
+				src_meta = "profile";
+			else if (source == GS_NIXOS_INSTALL_SOURCE_ENV)
+				src_meta = "env";
 
-	nixos_proceed_install (helper->page, helper->app, helper->interaction, helper->cancellable);
-	nixos_install_helper_free (helper);
+			gs_app_set_metadata (nixos_app, "NixOS::install-source", src_meta);
+			gs_page_install_app (helper->page, nixos_app, helper->interaction, helper->cancellable);
+		} else {
+			g_warning ("NixOS alternate not found");
+			if (gs_app_get_state (helper->app) == GS_APP_STATE_INSTALLING) {
+				gs_app_set_state (helper->app, GS_APP_STATE_AVAILABLE);
+			}
+		}
+		nixos_install_helper_free (helper);
+		return;
+	}
 }
 
 static void
@@ -413,6 +457,10 @@ nixos_get_alternates_cb (GObject *source_object, GAsyncResult *res, gpointer use
 	g_autoptr(GsPluginJob) job = NULL;
 	GsAppList *alternates = NULL;
 	gboolean has_flatpak = FALSE;
+	gboolean has_nixos = FALSE;
+	g_autoptr(GsPlugin) app_plugin = NULL;
+	gboolean is_nixos_app = FALSE;
+	gboolean is_flatpak_app = FALSE;
 	guint i;
 	g_autoptr(GSettings) settings = NULL;
 	g_autofree gchar *sys_backend = NULL;
@@ -422,15 +470,36 @@ nixos_get_alternates_cb (GObject *source_object, GAsyncResult *res, gpointer use
 	gboolean has_profile = FALSE;
 	guint active_count = 0;
 
+	app_plugin = gs_app_dup_management_plugin (helper->app);
+	if (app_plugin != NULL) {
+		is_nixos_app = (g_strcmp0 (gs_plugin_get_name (app_plugin), "nixos") == 0);
+		is_flatpak_app = (g_strcmp0 (gs_plugin_get_name (app_plugin), "flatpak") == 0);
+	}
+	has_flatpak = is_flatpak_app;
+	has_nixos = is_nixos_app;
+
 	if (gs_plugin_loader_job_process_finish (plugin_loader, res, &job, &error)) {
 		alternates = gs_plugin_job_list_apps_get_result_list (GS_PLUGIN_JOB_LIST_APPS (job));
 		for (i = 0; alternates != NULL && i < gs_app_list_length (alternates); i++) {
 			GsApp *alt = gs_app_list_index (alternates, i);
-			if (gs_app_get_bundle_kind (alt) == AS_BUNDLE_KIND_FLATPAK) {
-				has_flatpak = TRUE;
-				break;
+			g_autoptr(GsPlugin) alt_plugin = gs_app_dup_management_plugin (alt);
+			if (alt_plugin != NULL) {
+				if (g_strcmp0 (gs_plugin_get_name (alt_plugin), "nixos") == 0) {
+					has_nixos = TRUE;
+				}
+				if (g_strcmp0 (gs_plugin_get_name (alt_plugin), "flatpak") == 0) {
+					has_flatpak = TRUE;
+				}
 			}
 		}
+	}
+
+	if (!has_nixos) {
+		/* No NixOS package alternate, proceed with original app installation */
+		gs_app_set_metadata (helper->app, "NixOS::install-source", "flatpak");
+		nixos_proceed_install (helper->page, helper->app, helper->interaction, helper->cancellable);
+		nixos_install_helper_free (helper);
+		return;
 	}
 
 	settings = g_settings_new ("org.gnome.software");
@@ -457,6 +526,18 @@ nixos_get_alternates_cb (GObject *source_object, GAsyncResult *res, gpointer use
 		adw_dialog_present (ADW_DIALOG (dialog), GTK_WIDGET (priv->shell));
 	} else {
 		/* Only one choice or none, let plugin decide using default/active fallback */
+		if (active_count == 1) {
+			if (has_system)
+				gs_app_set_metadata (helper->app, "NixOS::install-source", "system");
+			else if (has_user)
+				gs_app_set_metadata (helper->app, "NixOS::install-source", "user");
+			else if (has_profile) {
+				if (g_strcmp0 (user_backend, "env") == 0)
+					gs_app_set_metadata (helper->app, "NixOS::install-source", "env");
+				else
+					gs_app_set_metadata (helper->app, "NixOS::install-source", "profile");
+			}
+		}
 		nixos_proceed_install (helper->page, helper->app, helper->interaction, helper->cancellable);
 		nixos_install_helper_free (helper);
 	}
@@ -469,12 +550,38 @@ gs_page_install_app (GsPage *page,
 		     GCancellable *cancellable)
 {
 	g_autoptr(GsPlugin) app_plugin = gs_app_dup_management_plugin (app);
-	if (app_plugin != NULL && g_strcmp0 (gs_plugin_get_name (app_plugin), "nixos") == 0 &&
+	gboolean is_nixos_app = (app_plugin != NULL && g_strcmp0 (gs_plugin_get_name (app_plugin), "nixos") == 0);
+	gboolean is_flatpak_app = (app_plugin != NULL && g_strcmp0 (gs_plugin_get_name (app_plugin), "flatpak") == 0);
+	g_autoptr(GSettings) settings = NULL;
+	g_autofree gchar *sys_backend = NULL;
+	g_autofree gchar *user_backend = NULL;
+	gboolean has_system = FALSE;
+	gboolean has_user = FALSE;
+	gboolean has_profile = FALSE;
+	guint active_count = 0;
+	GsPagePrivate *priv = NULL;
+	NixosInstallHelper *helper = NULL;
+	g_autoptr(GsAppQuery) query = NULL;
+	g_autoptr(GsPluginJob) job = NULL;
+
+	if (is_nixos_app || is_flatpak_app) {
+		settings = g_settings_new ("org.gnome.software");
+		sys_backend = g_settings_get_string (settings, "nixos-system-backend");
+		user_backend = g_settings_get_string (settings, "nixos-user-backend");
+		has_system = (g_strcmp0 (sys_backend, "declarative") == 0);
+		has_user = (g_strcmp0 (user_backend, "declarative") == 0);
+		has_profile = (g_strcmp0 (user_backend, "profile") == 0 || g_strcmp0 (user_backend, "env") == 0);
+
+		if (has_system) active_count++;
+		if (has_user) active_count++;
+		if (has_profile) active_count++;
+	}
+
+	if ((is_nixos_app || is_flatpak_app) &&
+	    active_count >= 1 &&
 	    gs_app_get_metadata_item (app, "NixOS::install-source") == NULL) {
-		GsPagePrivate *priv = gs_page_get_instance_private (page);
-		NixosInstallHelper *helper = g_slice_new0 (NixosInstallHelper);
-		g_autoptr(GsAppQuery) query = NULL;
-		g_autoptr(GsPluginJob) job = NULL;
+		priv = gs_page_get_instance_private (page);
+		helper = g_slice_new0 (NixosInstallHelper);
 
 		helper->page = g_object_ref (page);
 		helper->app = g_object_ref (app);

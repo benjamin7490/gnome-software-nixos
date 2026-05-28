@@ -70,10 +70,13 @@ add_source_row (GsNixosSourceDialog  *self,
 
 	/* Radio button */
 	GtkCheckButton *radio = GTK_CHECK_BUTTON (gtk_check_button_new ());
-	if (self->first_radio != NULL)
+	if (self->first_radio != NULL) {
 		gtk_check_button_set_group (radio, self->first_radio);
-	else
+	} else {
 		self->first_radio = radio;
+		self->chosen_source = source;
+		gtk_check_button_set_active (radio, TRUE);
+	}
 
 	adw_action_row_add_suffix (row, GTK_WIDGET (radio));
 	adw_action_row_set_activatable_widget (row, GTK_WIDGET (radio));
